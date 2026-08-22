@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: Build & test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Detect Cargo project
+        id: detect
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "cargo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cargo=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Cargo.toml yet - skipping cargo steps (bootstrap scaffolding)."
+          fi
+
+      - name: Show toolchain
+        if: steps.detect.outputs.cargo == 'true'
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Build
+        if: steps.detect.outputs.cargo == 'true'
+        run: cargo build --all-targets --verbose
+
+      - name: Test
+        if: steps.detect.outputs.cargo == 'true'
+        run: cargo test --verbose
+
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Detect Cargo project
+        id: detect
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "cargo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cargo=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Cargo.toml yet - skipping lint (bootstrap scaffolding)."
+          fi
+
+      - name: Add rustfmt + clippy
+        if: steps.detect.outputs.cargo == 'true'
+        run: rustup component add rustfmt clippy
+
+      - name: Check formatting
+        if: steps.detect.outputs.cargo == 'true'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        if: steps.detect.outputs.cargo == 'true'
+        run: cargo clippy --all-targets -- -D warnings
