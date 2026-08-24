@@ -5,3 +5,4 @@
 //! in later tasks (see `docs/features/001-crap4rust.md`).
 
 mod complexity;
+mod coverage;

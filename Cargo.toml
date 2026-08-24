@@ -10,3 +10,5 @@ syn = { version = "2", features = ["full", "visit"] }
 # `span-locations` makes proc-macro2 track line/column under the parser fallback,
 # so we can capture each function's source line span.
 proc-macro2 = { version = "1", features = ["span-locations"] }
+# Typed, minimal error for the coverage (LCOV) adapter edge.
+thiserror = "2"

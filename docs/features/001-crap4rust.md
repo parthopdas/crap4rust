@@ -75,7 +75,7 @@ One or more tasks per slice.
 |-----|-------|------|---------|--------|
 | T1  | S1 | **CC engine (`syn` visitor)** — walk items/exprs, apply C1 rules; attribute closure decisions to enclosing fn. _Assumes source-level only._ | **Done** | vibe/001 |
 | T2  | S1 | **Fn identity/naming** — `<Type as Trait>::method` form; free fns, impl methods, closures folded into parent (C4). | **Done** | vibe/001 |
-| T3  | S1 | **LCOV reader** — parse `DA` records → per-file line-hit map. | Pending | - |
+| T3  | S1 | **LCOV reader** — parse `DA` records → per-file line-hit map. | **Done** | vibe/001 |
 | T4  | S1 | **CRAP domain** — `crap(cc, cov)`; band classifier (1–5 / 5–30 / 30+), independent of `--threshold` (C11). Pure, no I/O. | Pending | - |
 | T5  | S1 | **Coverage join** — intersect fn `syn` span lines with LCOV covered/total → per-fn `cov`. | Pending | - |
 | T6  | S1 | **Table reporter** — header "CRAP Report", 5 columns, crap4go layout parity. | Pending | - |
@@ -131,6 +131,22 @@ One or more tasks per slice.
 - **D7** — Incremental/cached CC across runs.
 
 ## Notes & Decisions
+### T3 review notes (Anders — approve-with-suggestions, 2026-08-24)
+
+T3 (LCOV reader: pure `parse_lcov` + thin `load`, `coverage_in_range(file,start,end)->(covered,total)`,
+typed `LcovError`, `thiserror` dep) passed Bhaskar (full gate, 23 tests) and Anders' review. Forward
+constraints for T4/T5:
+
+- **T5 path normalization (high risk).** LCOV `SF:` paths (workspace-relative or absolute, incl. Windows
+  `C:\...`) will NOT match the CC engine's file paths byte-for-byte. A mismatch does not error — it
+  silently returns `(0,0)` ⇒ `cov=0` ⇒ **inflated CRAP on every function**. T5 must normalize both sides
+  to a common key AND use the `file()` `Option` accessor to detect a total LCOV-file miss (a bug signal)
+  distinctly from "function has no instrumented lines."
+- **T5 span type seam** — `FunctionComplexity` spans are `usize`; `coverage_in_range` takes `u32`. Use a
+  conscious `usize→u32` cast/`try_into` at the boundary.
+- **OPEN product decision (see C13 below) — `cov` when `total=0`** (function has no instrumented lines):
+  undefined `covered/total`. Swings CRAP maximally (`cov=0` ⇒ worst band; `cov=1` ⇒ best). Must match
+  crap4go. **Pending human ruling; needed before T5.**
 
 ### T2 review notes (Anders — approve-with-suggestions, 2026-08-24)
 
@@ -204,6 +220,32 @@ crap4go behavior** — divergences are now only the language-mechanical ones plu
 - **C10** baseline/delta gating: **deferred** (see D1); v1 reports all functions, no gating.
 - **C11** fixed display bands (1–5 / 5–30 / 30+); report-only (no `--threshold` gate in v1).
 - **C12** source-level only; async/macro limits documented.
+
+### C13 — `cov` semantics: `total=0` and file-absent (crap4go parity) — **OPEN, needs human ruling**
+
+Source-verified crap4go behavior (`internal/coverage/coverage.go` `CoverageForRange`, `internal/crap/crap.go`):
+
+- **File absent from the coverage profile** ⇒ `CoverageForRange` returns `nil` ⇒ `crap.Score` returns
+  `nil` ⇒ the function is **reported as `N/A`** for both Cov% and CRAP, and **sorts last** (unscored).
+  Maps to crap4rust `file()` == `None`.
+- **File present but the function's line range has no instrumented statements (`total==0`)** ⇒
+  `CoverageForRange` returns `0.0` ⇒ **cov = 0%** ⇒ `CRAP = cc²·1 + cc` (max risk for that CC).
+  Maps to crap4rust `file()==Some` with `total==0`.
+
+**Parity ⇒ `total=0` means `cov=0`**, i.e. the OPPOSITE of Anders' earlier lean (`cov=1`). Because most
+zero-statement functions are trivial (low CC), the CRAP inflation is bounded but non-zero. **Pending
+human decision (before T5): (a) crap4go parity — `total=0 ⇒ cov=0`; (b) Anders' lean — `total=0 ⇒
+cov=1`.** File-absent ⇒ `N/A`/unscored is adopted from parity regardless.
+
+### C14 — Table reporter format (T6, crap4go parity)
+
+Source-verified from `internal/crap/crap.go` `FormatReport`. T6 mirrors it:
+
+- Lines: `"CRAP Report"`, then `"==========="`, then header, then a `-`-repeat separator sized to the header.
+- Header/rows: `Function` (left, 30) · `Package`→**Module** (left, 35) · `CC` (right, 4) · `Cov%`
+  (right, 7) · `CRAP` (right, 8). (Go fmt `%-30s %-35s %4s %7s %8s`.)
+- Cell formats: Cov% = `%5.1f%%` (e.g. ` 87.5%`) or `  N/A ` when `None`; CRAP = `%8.1f` or `     N/A`.
+- **Sort by CRAP descending**; `None` CRAP sorts last; ties broken by `Name` ascending (stable).
 
 ### Architecture (O2 — dependency flow, Clean Architecture)
 
