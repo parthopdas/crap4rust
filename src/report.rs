@@ -21,11 +21,6 @@
 //! `{:<30}` behaves identically, so we simply match it (locked by
 //! `long_cells_overflow_and_do_not_truncate`). Per FC-T6 the table is C14's
 //! five columns only; `crap::band` is intentionally not wired in here.
-//!
-//! Reached only by tests until the CLI wires the pipeline (T7), so `dead_code`
-//! is allowed here, consistent with `join.rs`. **Remove this `allow` when T7
-//! wires the CLI.**
-#![allow(dead_code)]
 
 use std::cmp::Ordering;
 
@@ -42,6 +37,14 @@ pub(crate) struct ReportRow {
     /// Opaque module display string (`Module` column). Supplied by the caller;
     /// the reporter never derives crate identity itself (see module docs).
     pub(crate) module: String,
+    /// Source file path — **not** rendered by C14's table. Carried for the
+    /// stable identity key (C15) the JSON contract needs (T11).
+    #[allow(dead_code)]
+    pub(crate) file: String,
+    /// 1-based start line — **not** rendered by C14's table. Second half of the
+    /// C15 identity key; read by the JSON reporter (T11).
+    #[allow(dead_code)]
+    pub(crate) start_line: usize,
     /// Cyclomatic complexity (`CC` column).
     pub(crate) complexity: u32,
     /// Coverage fraction in `[0.0, 1.0]`, or `None` ⇒ `N/A` (C13).
@@ -60,6 +63,8 @@ pub(crate) fn rows_from_joined(fns: &[JoinedFunction]) -> Vec<ReportRow> {
         .map(|f| ReportRow {
             name: f.name.clone(),
             module: module_from_path(&f.file),
+            file: f.file.clone(),
+            start_line: f.start_line,
             complexity: f.complexity,
             coverage: f.coverage,
             crap: f.crap,
@@ -159,6 +164,8 @@ mod tests {
         ReportRow {
             name: name.to_string(),
             module: module.to_string(),
+            file: module.to_string(),
+            start_line: 1,
             complexity: cc,
             coverage,
             crap: crate::crap::score(cc, coverage),
@@ -281,6 +288,7 @@ an_extremely_long_function_name_well_past_thirty crate::deeply::nested::module::
         let joined = vec![JoinedFunction {
             name: "Foo::bar".to_string(),
             file: "./src/foo.rs".to_string(),
+            start_line: 12,
             complexity: 3,
             coverage: Some(0.5),
             crap: crate::crap::score(3, Some(0.5)),
@@ -292,6 +300,23 @@ an_extremely_long_function_name_well_past_thirty crate::deeply::nested::module::
         assert_eq!(rows[0].complexity, 3);
         assert_eq!(rows[0].coverage, Some(0.5));
         assert_eq!(rows[0].crap, crate::crap::score(3, Some(0.5)));
+    }
+
+    /// C15: the identity fields are carried through verbatim (un-normalized
+    /// `file`, plus `start_line`) alongside the display `module`.
+    #[test]
+    fn rows_from_joined_carries_c15_identity_fields() {
+        let joined = vec![JoinedFunction {
+            name: "Foo::bar".to_string(),
+            file: "./src/foo.rs".to_string(),
+            start_line: 12,
+            complexity: 3,
+            coverage: Some(0.5),
+            crap: crate::crap::score(3, Some(0.5)),
+        }];
+        let rows = rows_from_joined(&joined);
+        assert_eq!(rows[0].file, "./src/foo.rs");
+        assert_eq!(rows[0].start_line, 12);
     }
 
     #[test]

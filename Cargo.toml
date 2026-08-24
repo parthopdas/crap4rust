@@ -12,3 +12,7 @@ syn = { version = "2", features = ["full", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 # Typed, minimal error for the coverage (LCOV) adapter edge.
 thiserror = "2"
+# CLI argument parsing (`derive` = the declarative `#[derive(Parser)]` API).
+clap = { version = "4", features = ["derive"] }
+# Contextual error chaining at the CLI edge (exit-code 1 operational errors).
+anyhow = "1"

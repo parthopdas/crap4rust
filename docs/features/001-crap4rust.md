@@ -1,7 +1,7 @@
 <!-- Save as docs/features/<nnn>-<feature_name>.md — <nnn> = zero-padded next sequence number (highest existing + 1). -->
 # Feature: crap4rust — CRAP-metric quality gate for Rust
 **Branch:** vibe/001-crap4rust
-**Status:** Planning
+**Status:** In progress — S1 (walking skeleton) complete; next slice S2
 
 ## Requirements
 
@@ -79,9 +79,9 @@ One or more tasks per slice.
 | T4  | S1 | **CRAP domain** — `crap(cc, cov)`; band classifier (1–5 / 5–30 / 30+), independent of `--threshold` (C11). Pure, no I/O. | **Done** | vibe/001 |
 | T5  | S1 | **Coverage join** — intersect fn `syn` span lines with LCOV covered/total → per-fn `cov`. | **Done** | vibe/001 |
 | T6  | S1 | **Table reporter** — header "CRAP Report", 5 columns, crap4go layout parity. | **Done** | vibe/001 |
-| T7  | S1 | **CLI skeleton** — arg parse, wire pipeline, `--lcov-path`. | Pending | - |
-| T8  | S2 | **Coverage runner** — invoke `cargo llvm-cov` → default `target/crap4rust/coverage.lcov`; `--test-command` override; zero-config default (C2). | Pending | - |
-| T9  | S3 | **Workspace enumeration** — cargo metadata; per-member modules, crate-qualified (C3). | Pending | - |
+| T7  | S1 | **CLI skeleton** — arg parse, wire pipeline, `--lcov-path`. Also lands C15 (identity fields). | **Done** | vibe/001 |
+| T8  | S2 | **Coverage runner** — invoke `cargo llvm-cov` → default `target/crap4rust/coverage.lcov`; `--test-command` override; zero-config default (C2). Makes `--lcov-path` optional — `missing_required_lcov_arg_exits_one` legitimately changes (expected evolution, not a regression). | Pending | - |
+| T9  | S3 | **Workspace enumeration** — cargo metadata; per-member modules, crate-qualified (C3). Checklist: replace `report::rows_from_joined` module derivation (FC-T6a); move source discovery out of `cli.rs` into its adapter; FC-T5a longest-overlap + `Ambiguous` resolution; FC-T5e `SourceUnit` refactor. | Pending | - |
 | T10 | S3 | **Product/test filtering** — exclude `#[cfg(test)]`/`#[test]`; `tests/`/`benches/`/`examples/` non-product; positional path-fragment filters (C5). | Pending | - |
 | T11 | S4 | **JSON reporter** — versioned schema (`schema_version`), stable field contract. | Pending | - |
 | T12 | S5 | **Parallelism** — `rayon` across members/files; `-j/--jobs`, full CPUs default (C7). | Pending | - |
@@ -131,6 +131,72 @@ One or more tasks per slice.
 - **D7** — Incremental/cached CC across runs.
 
 ## Notes & Decisions
+### C16 — Bidirectional path matching — **DELIBERATE DIVERGENCE (verified, 2026-08-24)**
+
+crap4go's `suffixMatch` (`internal/coverage/coverage.go`, `unclebob/crap4go` @ `bee16db`) is
+**one-directional** — it returns `false` as soon as `len(suffixParts) > len(pathParts)`, so only the
+queried CC file path may be a suffix of the LCOV/profile key, never the reverse. crap4rust matches in
+**either** direction, because LCOV `SF:` keys are short/relative while the CC engine emits absolute
+paths; the one-directional rule would resolve nothing and print `N/A` for every function. Verified
+against upstream source. **FC-T5f reconciled** (T7).
+
+Secondary, recorded: our resolution order is **deterministic** (`BTreeMap`, lowest key wins) where
+upstream's Go map iteration is randomized. `normalizePath` parity is now **verified**, not assumed
+(`\`→`/`, strip one leading `./`). `CoverageForRange` returning `0.0` at `total==0` re-confirmed, so
+the C13 divergence stands as written.
+
+### T7 review notes (Anders — approve-with-suggestions, 2026-08-24)
+
+T7 (`src/cli.rs` + `src/main.rs`; `clap` derive + `anyhow`) closes **S1**. Bhaskar FAIL → fix → PASS
+(66 tests: 56 lib + 10 CLI integration; fmt/clippy/build/test clean), real-binary exit codes and
+stream isolation verified. Anders: "the skeleton walks — end-to-end and honest at every seam."
+
+Landed: pipeline wired (sorted `.rs` walk → CC → LCOV → join → rows → table → stdout via `print!`);
+exit codes 0/1 only via `try_parse` (never clap's default 2); errors/diagnostics → stderr;
+**C15** identity fields added additively with the C14 bytes unchanged; **FC-T5b** satisfied via
+`Resolution{Exact,Suffix,Unresolved}` + `JoinResult{functions,resolutions}` — status **as data**, the
+CLI edge does the printing, one diagnostic per source *file*, exit code unaffected; **FC-T4a** audit
+done (`LcovData::file()` made `#[cfg(test)]`-only rather than `#[allow]`-masked).
+
+Discharged: FC-T4a, FC-T5b, FC-T5d/C15, FC-T5f, FC-T6c, FC-T6e.
+Still parked: FC-T5a, FC-T5e (T9), FC-T5c (T13 docs), FC-T6a/b/d/f.
+
+New forward constraints:
+- **FC-T7a (T11 — identity portability).** C15's `file` is the **raw** path as given (`src\lib.rs` on
+  Windows, absolute if the user passed absolute). The table is insulated (`module_from_path`
+  normalizes); a JSON `file` field is not. **T11 must emit a normalized, forward-slashed,
+  workspace-relative `file`** or `schema_version` freezes a platform-dependent identity key.
+- **FC-T6b extension.** Determinism now covers `resolutions`/diagnostics too — diagnostic order
+  follows input order; T12 must preserve it.
+- **FC-T7b (`RunOutput` invariant).** One field per output stream, nothing else. No exit codes, no
+  summary counts, no "exceeded the band" flags — a third non-stream field means the deferred gate
+  (D1) is leaking in early. T11 selects the reporter **inside** `run`; format branching must not move
+  into `main.rs`.
+- **FC-T7c (T8 — `RunConfig`).** Once T8/T9/T12 add `--test-command`, workspace roots and `-j`,
+  introduce a plain `RunConfig` with `From<&Cli>` so `run` is exercisable without an arg parser.
+  Not worth it at two fields.
+- **FC-T7d (known temporary deviation).** `docs/design.md` draws workspace/source discovery as an
+  **adapter**; for S1 it lives in `cli.rs`. Owed to T9 — not the settled architecture.
+- **FC-T7e (T11 product question).** Diagnostics are pre-rendered `Vec<String>`, stderr-only. Fine
+  forever **if** JSON output also emits them only to stderr. If resolution warnings should appear
+  inside the JSON document, `Vec<String>` is the wrong carrier and the structured form must exist
+  **before** `schema_version` freezes. Rule at T11.
+
+Non-blocking, unactioned (recorded so they are not rediscovered): the S1 walk descends into `target/`
+and dot-directories — cheap two-line guard, or document "point it at `src/`" and defer wholly to T10;
+no symlink-cycle guard (T9's cargo-metadata enumeration removes the exposure);
+`a_directory_is_walked_for_rs_files_in_sorted_order` leans on cargo's cwd — `CARGO_MANIFEST_DIR`
+would make it stand alone.
+
+### C15 — Function identity (FC-T5d) — **RESOLVED (human, 2026-08-24)**
+
+**Decision: Anders' option 1.** Additively carry `file` + `start_line` through
+`FunctionComplexity` → `JoinedFunction` → `ReportRow`, **at T7** (during the `allow(dead_code)`
+audit). The **v1 table is unchanged** — C14 layout and its byte-locked tests stay exactly as-is;
+duplicate-looking rows are accepted in the table and documented as a limit in T13. The fields exist so
+T11's JSON contract has a stable identity key before `schema_version` is frozen. Also resolves
+**FC-T6c** (`ReportRow` no longer drops `file`).
+
 ### T6 review notes (Anders — approve-with-suggestions, 2026-08-24)
 
 T6 (`src/report.rs`: `ReportRow{name,module,complexity,coverage,crap}`, pure

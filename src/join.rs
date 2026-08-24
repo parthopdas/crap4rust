@@ -11,22 +11,23 @@
 //!    do not match byte-for-byte (relative vs absolute, `./` prefix, `\` vs
 //!    `/`). A naive exact lookup silently returns `(0,0)` ⇒ `cov=0` ⇒ inflated
 //!    CRAP on every function. We delegate to [`LcovData::resolve_path`], which
-//!    mirrors crap4go's normalize + segment-suffix matching, and keep the
+//!    follows crap4go's normalize + segment-suffix matching (normalization is
+//!    verified-identical; the *bidirectional* suffix match is a deliberate,
+//!    documented divergence — see [`LcovData::resolve_path`]), and keep the
 //!    file-absent vs file-present distinction all the way to the join contract.
+//!    The *exactness* of each match is carried out as data
+//!    ([`JoinResult::resolutions`]) so the CLI can emit a stderr diagnostic
+//!    (FC-T5b) — this module never prints.
 //! 2. **The C13 join contract** — file-absent ⇒ `None` (N/A, unscored);
 //!    file-present with no instrumented lines (`total==0`) ⇒ `Some(1.0)` (the
 //!    deliberate divergence from crap4go); otherwise `Some(covered/total)`.
 //!
 //! Sorting, `N/A`-last ordering, the table columns (C14), and the "Module"
 //! display string (C3/S3) are the reporter's job (T6/T7), not this module — we
-//! only carry `file` through. Reached only by tests until the CLI wires the
-//! pipeline (T7), so `dead_code` is allowed here, consistent with
-//! `complexity.rs`/`coverage.rs`. **Remove this `allow` when T7 wires the CLI**
-//! and the pipeline actually calls `join`.
-#![allow(dead_code)]
+//! only carry `file` and `start_line` through.
 
 use crate::complexity::FunctionComplexity;
-use crate::coverage::LcovData;
+use crate::coverage::{LcovData, Resolution};
 use crate::crap;
 
 /// One function after the coverage join: its complexity, resolved coverage
@@ -37,6 +38,10 @@ pub(crate) struct JoinedFunction {
     /// Source file path (as given to the join). Carried through for T6/T7
     /// "Module" derivation; not normalized here.
     pub(crate) file: String,
+    /// 1-based start line of the function, carried straight from
+    /// [`FunctionComplexity`]. With `file` it forms the stable identity key
+    /// (C15) that disambiguates functions sharing a display name.
+    pub(crate) start_line: usize,
     /// Cyclomatic complexity.
     pub(crate) complexity: u32,
     /// Coverage fraction in `[0.0, 1.0]`, or `None` when the file is absent
@@ -47,33 +52,54 @@ pub(crate) struct JoinedFunction {
     pub(crate) crap: Option<f64>,
 }
 
+/// The join's output: the per-function results plus the per-file path
+/// resolutions that produced them.
+pub(crate) struct JoinResult<'a> {
+    /// One entry per input function, in input order.
+    pub(crate) functions: Vec<JoinedFunction>,
+    /// One entry per input file, in input order: the path as given, and how it
+    /// resolved against the LCOV key space (FC-T5b). Borrowed keys point into
+    /// the [`LcovData`] the join was run against.
+    pub(crate) resolutions: Vec<(String, Resolution<'a>)>,
+}
+
 /// Join per-file CC results against `lcov`, producing one [`JoinedFunction`]
-/// per input function.
+/// per input function plus how each input file's path resolved (FC-T5b).
 ///
 /// `files` pairs each source file path with the functions the CC engine found
 /// in it — the association `FunctionComplexity` itself does not carry. Output
 /// order follows the input; sorting/formatting is the reporter's job (C14).
-pub(crate) fn join(
-    lcov: &LcovData,
+///
+/// The join stays **pure**: it *reports* resolution status as data and never
+/// prints. Turning a non-exact or unresolved match into a stderr diagnostic is
+/// the CLI edge's job.
+pub(crate) fn join<'a>(
+    lcov: &'a LcovData,
     files: &[(String, Vec<FunctionComplexity>)],
-) -> Vec<JoinedFunction> {
-    let mut out = Vec::new();
+) -> JoinResult<'a> {
+    let mut functions = Vec::new();
+    let mut resolutions = Vec::new();
     for (file, fns) in files {
         // Resolve the file once per file, not per function.
         let resolved = lcov.resolve_path(file);
+        resolutions.push((file.clone(), resolved));
         for fc in fns {
             let coverage = coverage_for(lcov, resolved, fc);
             let crap = crap::score(fc.complexity, coverage);
-            out.push(JoinedFunction {
+            functions.push(JoinedFunction {
                 name: fc.name.clone(),
                 file: file.clone(),
+                start_line: fc.start_line,
                 complexity: fc.complexity,
                 coverage,
                 crap,
             });
         }
     }
-    out
+    JoinResult {
+        functions,
+        resolutions,
+    }
 }
 
 /// Apply the C13 contract for one function given its file's resolution result.
@@ -81,8 +107,8 @@ pub(crate) fn join(
 /// The returned `Some` fraction is always in `[0.0, 1.0]` and never NaN:
 /// `covered ≤ total` by construction in [`LcovData::coverage_in_range`], and
 /// the `total == 0` branch short-circuits before any division (FC-T4b).
-fn coverage_for(lcov: &LcovData, resolved: Option<&str>, fc: &FunctionComplexity) -> Option<f64> {
-    let key = resolved?; // file absent ⇒ None (N/A, unscored).
+fn coverage_for(lcov: &LcovData, resolved: Resolution<'_>, fc: &FunctionComplexity) -> Option<f64> {
+    let key = resolved.key()?; // file absent ⇒ None (N/A, unscored).
     let (covered, total) =
         lcov.coverage_in_range(key, line_to_u32(fc.start_line), line_to_u32(fc.end_line));
     if total == 0 {
@@ -132,7 +158,7 @@ end_of_record
 
     fn join_one(file: &str, fc: FunctionComplexity) -> JoinedFunction {
         let lcov = parse_lcov(FIXTURE).expect("valid fixture");
-        let mut out = join(&lcov, &[(file.to_string(), vec![fc])]);
+        let mut out = join(&lcov, &[(file.to_string(), vec![fc])]).functions;
         assert_eq!(out.len(), 1);
         out.pop().unwrap()
     }
@@ -205,12 +231,45 @@ end_of_record
                 fc("no_da", 9, 100, 110),
             ],
         )];
-        for j in join(&lcov, &files) {
+        for j in join(&lcov, &files).functions {
             if let Some(cov) = j.coverage {
                 assert!((0.0..=1.0).contains(&cov), "cov {cov} out of [0,1]");
                 assert!(!cov.is_nan(), "cov is NaN");
             }
         }
+    }
+
+    #[test]
+    fn resolutions_report_one_status_per_file_in_input_order() {
+        // FC-T5b: the join surfaces *how* each file resolved, one entry per
+        // source file (not per function), without printing anything.
+        let lcov = parse_lcov(FIXTURE).expect("valid fixture");
+        let files = vec![
+            (
+                "src/lib.rs".to_string(),
+                vec![fc("exact_a", 1, 10, 13), fc("exact_b", 1, 20, 21)],
+            ),
+            (
+                "/abs/proj/src/lib.rs".to_string(),
+                vec![fc("sfx", 1, 10, 13)],
+            ),
+            ("src/other.rs".to_string(), vec![fc("gone", 1, 10, 13)]),
+        ];
+        let result = join(&lcov, &files);
+
+        assert_eq!(
+            result.resolutions,
+            vec![
+                ("src/lib.rs".to_string(), Resolution::Exact("src/lib.rs")),
+                (
+                    "/abs/proj/src/lib.rs".to_string(),
+                    Resolution::Suffix("src/lib.rs")
+                ),
+                ("src/other.rs".to_string(), Resolution::Unresolved),
+            ]
+        );
+        // The two functions in the first file yield a single resolution entry.
+        assert_eq!(result.functions.len(), 4);
     }
 
     /// End-to-end span seam: real `syn` spans from the CC engine flow through
@@ -278,7 +337,7 @@ DA:11,0
 end_of_record
 ";
         let lcov = parse_lcov(LCOV).expect("valid fixture");
-        let joined = join(&lcov, &[("src/demo.rs".to_string(), fns.clone())]);
+        let joined = join(&lcov, &[("src/demo.rs".to_string(), fns.clone())]).functions;
 
         let jf = |name: &str| {
             joined

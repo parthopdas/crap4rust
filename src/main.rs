@@ -1,9 +1,53 @@
 //! crap4rust — CRAP metric for Rust cargo workspaces.
 //!
-//! This binary is a walking skeleton: only the pure cyclomatic-complexity engine
-//! (in the library crate) exists so far. The CLI, coverage adapter, CRAP domain,
-//! and reporters land in later tasks (see `docs/features/001-crap4rust.md`).
+//! Thin entrypoint: it owns only the process concerns (argument parsing hand-off
+//! and exit codes) and delegates all work to the library's `cli` module.
+//!
+//! **Exit codes (C6 — crap4go parity).** `0` on success, *including* when
+//! high-CRAP functions are reported and when coverage paths resolve only
+//! fuzzily or not at all; `1` on operational error only. Errors and coverage
+//! resolution diagnostics (FC-T5b) go to stderr, the report to stdout. Clap's
+//! own default of exit 2 for bad arguments is deliberately overridden via
+//! `try_parse`, and the error is rendered explicitly rather than relying on
+//! `Termination`'s `Debug` formatting.
 
-fn main() {
-    // The CLI (arg parsing, pipeline wiring, exit codes) is task T7. Nothing to run yet.
+use std::process::ExitCode;
+
+use clap::Parser;
+use crap4rust::cli::{self, Cli};
+
+/// Operational-error exit code (C6).
+const FAILURE: u8 = 1;
+
+fn main() -> ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            // Clap routes `--help`/`--version` to stdout and real argument
+            // errors to stderr; `use_stderr` distinguishes the two.
+            let _ = err.print();
+            return if err.use_stderr() {
+                ExitCode::from(FAILURE)
+            } else {
+                ExitCode::SUCCESS
+            };
+        }
+    };
+
+    match cli::run(&cli) {
+        Ok(output) => {
+            // Advisory only — diagnostics never change the exit code (C6).
+            for diagnostic in &output.diagnostics {
+                eprintln!("{diagnostic}");
+            }
+            // `format_report` is fully newline-terminated (FC-T6e).
+            let report = output.report;
+            print!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::from(FAILURE)
+        }
+    }
 }

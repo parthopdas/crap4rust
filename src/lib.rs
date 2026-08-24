@@ -1,8 +1,10 @@
 //! crap4rust — CRAP metric for Rust cargo workspaces.
 //!
-//! This library is a walking skeleton: only the pure cyclomatic-complexity
-//! engine exists so far. The coverage adapter, CRAP domain, and reporters land
-//! in later tasks (see `docs/features/001-crap4rust.md`).
+//! The pure core (CC engine, CRAP domain, coverage join) and the adapters
+//! (LCOV reader, table reporter) live in private modules; [`cli`] is the only
+//! surface the binary needs (see `docs/features/001-crap4rust.md`).
+
+pub mod cli;
 
 mod complexity;
 mod coverage;

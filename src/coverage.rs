@@ -13,11 +13,7 @@
 //! layer does not normalize or canonicalize them — path matching against `syn`
 //! spans is the T5 join's job.
 //!
-//! Consumed by the coverage join (T5) and CLI wiring (T7); until then it is
-//! exercised only by unit tests, so `dead_code` is allowed here.
-//! **Remove this `allow` when T7 wires the CLI** and the pipeline actually
-//! calls these items.
-#![allow(dead_code)]
+//! Consumed by the coverage join (T5) and CLI wiring (T7).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -53,32 +49,75 @@ pub(crate) struct LcovData {
     files: BTreeMap<String, BTreeMap<u32, u64>>,
 }
 
+/// How a source path resolved against the LCOV key space (FC-T5b).
+///
+/// The variants carry *how* a file was matched, not just the key, so callers
+/// that must report the resolution (the CLI's stderr diagnostics) can tell an
+/// exact hit from a merely plausible suffix hit or an outright miss. The join
+/// only ever needs [`key`](Resolution::key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Resolution<'a> {
+    /// The query matched a stored key exactly (after normalization).
+    Exact(&'a str),
+    /// The query matched a stored key only by segment-wise suffix — plausible,
+    /// but not proof that it is the same file.
+    Suffix(&'a str),
+    /// No stored key covers the query: the file is absent from the profile.
+    Unresolved,
+}
+
+impl<'a> Resolution<'a> {
+    /// The matching **stored** key, to be fed back into
+    /// [`LcovData::coverage_in_range`]; `None` when unresolved.
+    pub(crate) fn key(self) -> Option<&'a str> {
+        match self {
+            Self::Exact(key) | Self::Suffix(key) => Some(key),
+            Self::Unresolved => None,
+        }
+    }
+}
+
 impl LcovData {
     /// Line-hit map for `file`, if the LCOV data contains a section for it.
-    pub(crate) fn file(&self, file: &str) -> Option<&BTreeMap<u32, u64>> {
+    ///
+    /// Test-only: the wired pipeline never needs a raw, unnormalized lookup —
+    /// it goes through [`resolve_path`](Self::resolve_path) +
+    /// [`coverage_in_range`](Self::coverage_in_range). It survives as the
+    /// parser's unit-test assertion surface, so it is compiled out of
+    /// production builds rather than annotated as dead.
+    #[cfg(test)]
+    fn file(&self, file: &str) -> Option<&BTreeMap<u32, u64>> {
         self.files.get(file)
     }
 
     /// Resolve a query path (a CC-engine source path) to the LCOV key that
-    /// covers it, mirroring crap4go's `segmentsForFile`. Returns the matching
-    /// **stored** key (to be fed back into [`coverage_in_range`]), or `None`
-    /// when the file is genuinely absent from the coverage profile.
+    /// covers it, in the spirit of crap4go's `segmentsForFile`. Returns *how*
+    /// it resolved (FC-T5b) — the matching **stored** key plus its exactness,
+    /// or [`Resolution::Unresolved`] when the file is genuinely absent from the
+    /// coverage profile.
     ///
     /// Matching is path-separator- and `./`-insensitive (see [`normalize_path`]):
     /// 1. exact match on normalized keys; else
     /// 2. segment-wise **suffix** match — the shorter path's `/`-segments are a
-    ///    suffix of the longer's (either direction), e.g. `src/lib.rs` resolves
-    ///    an absolute `/abs/proj/src/lib.rs` key and vice-versa.
+    ///    suffix of the longer's, **in either direction** (see [`is_suffix`]),
+    ///    e.g. `src/lib.rs` resolves an absolute `/abs/proj/src/lib.rs` key and
+    ///    vice-versa.
+    ///
+    /// Step 2's bidirectionality is a **deliberate divergence** from crap4go —
+    /// see [`is_suffix`] for the verified upstream behaviour and the rationale.
+    /// The two-pass shape (exact, then suffix) matches upstream's
+    /// `segmentsForFile`; unlike Go's randomized map iteration, our `BTreeMap`
+    /// makes "first suffix hit wins" deterministic (lowest key order).
     ///
     /// The raw key map stays private; the join owns this key space, so the
     /// normalization lives here rather than leaking the inner `BTreeMap`.
-    pub(crate) fn resolve_path(&self, path: &str) -> Option<&str> {
+    pub(crate) fn resolve_path(&self, path: &str) -> Resolution<'_> {
         let query = normalize_path(path);
         // 1. Exact match on normalized keys (an exact hit wins over a partial
         //    suffix hit, which is why this pass is kept separate).
         for key in self.files.keys() {
             if normalize_path(key) == query {
-                return Some(key.as_str());
+                return Resolution::Exact(key.as_str());
             }
         }
         // 2. Segment-wise suffix match.
@@ -87,10 +126,10 @@ impl LcovData {
             let key_norm = normalize_path(key);
             let key_segs = segments(&key_norm);
             if is_suffix(&query_segs, &key_segs) {
-                return Some(key.as_str());
+                return Resolution::Suffix(key.as_str());
             }
         }
-        None
+        Resolution::Unresolved
     }
 
     /// Coverage over the inclusive line range `[start_line, end_line]` of `file`.
@@ -200,8 +239,12 @@ fn parse_da(rest: &str) -> Option<(u32, u64)> {
     Some((line_no, hits))
 }
 
-/// Normalize a path for cross-side matching (crap4go `normalizePath`): convert
-/// Windows separators `\` → `/`, then strip a single leading `./`.
+/// Normalize a path for cross-side matching: convert Windows separators
+/// `\` → `/`, then strip a single leading `./`.
+///
+/// **Verified parity** with crap4go's `normalizePath`
+/// (`internal/coverage/coverage.go`, `unclebob/crap4go` @ `bee16db`), which is
+/// `strings.TrimPrefix(strings.ReplaceAll(path, "\\", "/"), "./")`.
 fn normalize_path(path: &str) -> String {
     let slashed = path.replace('\\', "/");
     slashed.strip_prefix("./").unwrap_or(&slashed).to_string()
@@ -212,8 +255,17 @@ fn segments(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
 }
 
-/// crap4go `suffixMatch`: the shorter segment list is a suffix of the longer
-/// (either direction). Empty lists never match.
+/// True when the shorter segment list is a suffix of the longer, **in either
+/// direction**. Empty lists never match.
+///
+/// **Deliberate divergence from crap4go — verified.** Upstream's `suffixMatch`
+/// (`internal/coverage/coverage.go`, `unclebob/crap4go` @ `bee16db`) is
+/// *one-directional*: it returns `false` as soon as
+/// `len(suffixParts) > len(pathParts)`, so only the queried file path may be a
+/// suffix of the profile key, never the reverse. We match both ways on purpose:
+/// LCOV `SF:` keys are typically short and repo-relative while the CC engine
+/// reports absolute paths, so the one-directional rule would fail to resolve
+/// and report `N/A` for essentially every function.
 fn is_suffix(a: &[&str], b: &[&str]) -> bool {
     let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     !short.is_empty() && long.ends_with(short)
@@ -353,5 +405,43 @@ end_of_record
         // After end_of_record, a DA with no new SF has no open section.
         let err = parse_lcov("SF:src/a.rs\nDA:1,3\nend_of_record\nDA:2,4\n").unwrap_err();
         assert!(matches!(err, LcovError::DaBeforeSf));
+    }
+
+    #[test]
+    fn resolve_path_reports_exact_match() {
+        let data = parse_lcov("SF:src/a.rs\nDA:1,3\nend_of_record\n").expect("valid LCOV");
+        // Byte-identical, and normalization-equivalent, queries are all exact.
+        for query in ["src/a.rs", "./src/a.rs", "src\\a.rs"] {
+            assert_eq!(
+                data.resolve_path(query),
+                Resolution::Exact("src/a.rs"),
+                "query {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_path_reports_suffix_match_with_key() {
+        let data =
+            parse_lcov("SF:/abs/proj/src/a.rs\nDA:1,3\nend_of_record\n").expect("valid LCOV");
+        // Shorter query is a segment-wise suffix of the stored key, and the
+        // stored key is reported so the CLI can name it (FC-T5b).
+        assert_eq!(
+            data.resolve_path("src/a.rs"),
+            Resolution::Suffix("/abs/proj/src/a.rs")
+        );
+    }
+
+    #[test]
+    fn resolve_path_reports_unresolved() {
+        let data = parse_lcov("SF:src/a.rs\nDA:1,3\nend_of_record\n").expect("valid LCOV");
+        assert_eq!(data.resolve_path("src/other.rs"), Resolution::Unresolved);
+    }
+
+    #[test]
+    fn resolution_key_exposes_the_stored_key() {
+        assert_eq!(Resolution::Exact("src/a.rs").key(), Some("src/a.rs"));
+        assert_eq!(Resolution::Suffix("src/a.rs").key(), Some("src/a.rs"));
+        assert_eq!(Resolution::Unresolved.key(), None);
     }
 }

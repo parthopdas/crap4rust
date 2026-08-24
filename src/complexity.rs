@@ -10,9 +10,7 @@
 //! itself a decision point. These are deliberate, documented limitations (C12).
 //!
 //! The public surface below is consumed by later pipeline tasks (naming/identity,
-//! CRAP join, CLI). Until the CLI is wired it is exercised only by unit tests, so
-//! `dead_code` is allowed here rather than littering each item with `#[allow]`.
-#![allow(dead_code)]
+//! CRAP join, CLI).
 
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};

@@ -17,16 +17,14 @@
 //! Bands are **report-only** and independent of any `--threshold` gate (C11):
 //! classification here never affects exit codes (C6 parity — reporter, not gate).
 //!
-//! Consumed by the coverage join (T5) and reporter (T6); until the pipeline is
-//! wired it is exercised only by unit tests, so `dead_code` is allowed here.
-//! `crap`/`score` go live once the pipeline is wired (T5/T6/T7), but
-//! **`band`/`RiskBand` stay unused until S5 (display-band coloring)** — so this
-//! module-level allow (or, equivalently, a targeted `#[allow(dead_code)]` on
-//! `band`/`RiskBand`) must **stay until S5**, not be removed at T5/T7 (FC-T4a).
-#![allow(dead_code)]
+//! Consumed by the coverage join (T5) and reporter (T6). `crap`/`score` are
+//! live in the wired pipeline; **`band`/`RiskBand` stay unused until S5
+//! (display-band coloring)**, so they each carry a targeted
+//! `#[allow(dead_code)]` that must **stay until S5** (FC-T4a).
 
 /// Fixed display bands for a CRAP score (C11). Report-only; independent of any
 /// threshold gate.
+#[allow(dead_code)] // Unused until S5 (display-band coloring) — FC-T4a.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RiskBand {
     /// CRAP ≤ 5.0.
@@ -61,6 +59,7 @@ pub(crate) fn score(cc: u32, cov: Option<f64>) -> Option<f64> {
 /// band**: `crap ≤ 5.0 → Low`, `5.0 < crap ≤ 30.0 → Moderate`,
 /// `crap > 30.0 → High`. So exactly `5.0` is `Low` and exactly `30.0` is
 /// `Moderate`.
+#[allow(dead_code)] // Unused until S5 (display-band coloring) — FC-T4a.
 pub(crate) fn band(crap: f64) -> RiskBand {
     if crap <= 5.0 {
         RiskBand::Low
