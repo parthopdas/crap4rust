@@ -1,0 +1,12 @@
+[package]
+name = "crap4rust"
+version = "0.1.0"
+edition = "2021"
+description = "Computes the CRAP (Change Risk Anti-Patterns) metric per function for Rust cargo workspaces."
+
+[dependencies]
+# `full` = all Rust syntax; `visit` = the read-only AST visitor used by the CC engine.
+syn = { version = "2", features = ["full", "visit"] }
+# `span-locations` makes proc-macro2 track line/column under the parser fallback,
+# so we can capture each function's source line span.
+proc-macro2 = { version = "1", features = ["span-locations"] }
