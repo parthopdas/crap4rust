@@ -6,3 +6,4 @@
 
 mod complexity;
 mod coverage;
+mod crap;

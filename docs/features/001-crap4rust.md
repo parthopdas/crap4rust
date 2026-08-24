@@ -76,7 +76,7 @@ One or more tasks per slice.
 | T1  | S1 | **CC engine (`syn` visitor)** — walk items/exprs, apply C1 rules; attribute closure decisions to enclosing fn. _Assumes source-level only._ | **Done** | vibe/001 |
 | T2  | S1 | **Fn identity/naming** — `<Type as Trait>::method` form; free fns, impl methods, closures folded into parent (C4). | **Done** | vibe/001 |
 | T3  | S1 | **LCOV reader** — parse `DA` records → per-file line-hit map. | **Done** | vibe/001 |
-| T4  | S1 | **CRAP domain** — `crap(cc, cov)`; band classifier (1–5 / 5–30 / 30+), independent of `--threshold` (C11). Pure, no I/O. | Pending | - |
+| T4  | S1 | **CRAP domain** — `crap(cc, cov)`; band classifier (1–5 / 5–30 / 30+), independent of `--threshold` (C11). Pure, no I/O. | **Done** | vibe/001 |
 | T5  | S1 | **Coverage join** — intersect fn `syn` span lines with LCOV covered/total → per-fn `cov`. | Pending | - |
 | T6  | S1 | **Table reporter** — header "CRAP Report", 5 columns, crap4go layout parity. | Pending | - |
 | T7  | S1 | **CLI skeleton** — arg parse, wire pipeline, `--lcov-path`. | Pending | - |
@@ -131,6 +131,27 @@ One or more tasks per slice.
 - **D7** — Incremental/cached CC across runs.
 
 ## Notes & Decisions
+### T4 review notes (Anders — approve-with-suggestions, 2026-08-24)
+
+T4 (`src/crap.rs`: pure `crap(cc:u32,cov:f64)->f64`, `score(cc,Option<f64>)->Option<f64>`,
+`band(f64)->RiskBand{Low,Moderate,High}`) passed Bhaskar full gate (28 tests) and Anders' review.
+Boundary inclusivity: `≤5→Low`, `5<..≤30→Moderate`, `>30→High` (so 5.0→Low, 30.0→Moderate) — internal
+presentation, C11-only (crap4go has no bands), no parity contract, documented at the fn (no divergence
+entry needed). `Option<f64>` is the domain↔join seam; C13 `total=0⇒cov=1` is NOT encoded here (T5 owns it).
+
+Forward constraints to honor:
+- **FC-T4a (dead_code plan correction).** `crap`/`score` go live at T5/T6; **`band`/`RiskBand` stay
+  unused until S5 (display-band coloring)**. Do NOT expect a clean blanket removal of
+  `#![allow(dead_code)]` from `crap.rs` at T7 — keep a **targeted** `#[allow(dead_code)]` on
+  `band`/`RiskBand` (or defer the module-allow removal) until S5. The module doc-comment's "remove at
+  T5/T7" line is inaccurate for `band`; fix when reaching T5.
+- **FC-T4b (domain invariant).** `crap()` assumes `cov ∈ [0.0,1.0]`. **T5 MUST deliver
+  `cov ∈ [0.0,1.0]` or `None`** (no NaN, no out-of-range) — else `(1−cov)³` goes negative / NaN
+  propagates and `band(NaN)` silently returns High. T5 owns this enforcement (optionally a
+  `debug_assert!` could be added to `crap()` later).
+- **FC-T6 (no band column).** T6's table is C14's 5 columns only (Function·Module·CC·Cov%·CRAP);
+  `band()` is NOT a T6 dependency — do not wire it into the reporter table.
+
 ### T3 review notes (Anders — approve-with-suggestions, 2026-08-24)
 
 T3 (LCOV reader: pure `parse_lcov` + thin `load`, `coverage_in_range(file,start,end)->(covered,total)`,
@@ -221,21 +242,23 @@ crap4go behavior** — divergences are now only the language-mechanical ones plu
 - **C11** fixed display bands (1–5 / 5–30 / 30+); report-only (no `--threshold` gate in v1).
 - **C12** source-level only; async/macro limits documented.
 
-### C13 — `cov` semantics: `total=0` and file-absent (crap4go parity) — **OPEN, needs human ruling**
+### C13 — `cov` semantics: `total=0` and file-absent — **RESOLVED (human, 2026-08-24)**
 
-Source-verified crap4go behavior (`internal/coverage/coverage.go` `CoverageForRange`, `internal/crap/crap.go`):
+**Decision: option (b) — `total=0 ⇒ cov=1`** (function has no instrumented lines ⇒ nothing to test ⇒
+no risk ⇒ best band). This is a **deliberate divergence from crap4go**, which returns `0.0` (0%) for
+`total==0`. Rationale: a zero-instrumented-line function is not under-tested, so it should not be flagged.
 
-- **File absent from the coverage profile** ⇒ `CoverageForRange` returns `nil` ⇒ `crap.Score` returns
-  `nil` ⇒ the function is **reported as `N/A`** for both Cov% and CRAP, and **sorts last** (unscored).
-  Maps to crap4rust `file()` == `None`.
-- **File present but the function's line range has no instrumented statements (`total==0`)** ⇒
-  `CoverageForRange` returns `0.0` ⇒ **cov = 0%** ⇒ `CRAP = cc²·1 + cc` (max risk for that CC).
-  Maps to crap4rust `file()==Some` with `total==0`.
+File-absent handling is **kept at parity**: `file()==None` ⇒ `cov = None` ⇒ reported `N/A`, unscored,
+sorts last.
 
-**Parity ⇒ `total=0` means `cov=0`**, i.e. the OPPOSITE of Anders' earlier lean (`cov=1`). Because most
-zero-statement functions are trivial (low CC), the CRAP inflation is bounded but non-zero. **Pending
-human decision (before T5): (a) crap4go parity — `total=0 ⇒ cov=0`; (b) Anders' lean — `total=0 ⇒
-cov=1`.** File-absent ⇒ `N/A`/unscored is adopted from parity regardless.
+Join contract for T5 (given `coverage_in_range → (covered,total)` and `file()`):
+- `file()==None` ⇒ `cov=None` (N/A, unscored).
+- `file()==Some` & `total==0` ⇒ `cov=Some(1.0)`.
+- `file()==Some` & `total>0` ⇒ `cov=Some(covered/total)`.
+
+Source-verified crap4go behavior (for the record; we diverge only on `total=0`):
+- File absent ⇒ `CoverageForRange` returns `nil` ⇒ `Score` returns `nil` ⇒ `N/A`, sorts last.
+- File present, `total==0` ⇒ returns `0.0` ⇒ cov 0% (**we instead use `cov=1`**).
 
 ### C14 — Table reporter format (T6, crap4go parity)
 
