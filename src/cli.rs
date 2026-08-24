@@ -10,10 +10,14 @@
 //! output; `main` maps `Err` to stderr + exit code 1, writes diagnostics to
 //! stderr, and prints the report to stdout (C6).
 //!
-//! **S1 surface only.** `--lcov-path` is required because running coverage is
-//! T8/S2; source discovery is a deliberately minimal `.rs` walk because
-//! workspace enumeration is T9 and product/test filtering is T10. There is no
-//! `--threshold`: v1 is a reporter, not a gate (C6/C11/D1).
+//! **S2 surface.** Coverage is zero-config (C2): without `--lcov-path` the
+//! coverage command runs first and the LCOV artifact *it* produced is read
+//! back. Which of the two it is, and the whole artifact lifecycle around a
+//! generated one, is the runner adapter's policy ([`crate::runner`]) — this
+//! module only asks it for a path to read. Source discovery is still a
+//! deliberately minimal `.rs` walk because workspace enumeration is T9 and
+//! product/test filtering is T10. There is no `--threshold`: v1 is a reporter,
+//! not a gate (C6/C11/D1).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,19 +25,87 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context};
 use clap::Parser;
 
+use crate::runner::CoverageSource;
 use crate::{complexity, coverage, join, report};
 
-/// `crap4rust --lcov-path <PATH> <PATH>` — the S1 walking-skeleton surface.
+/// `crap4rust [--lcov-path <PATH>] [--test-command <COMMAND>] <PATH>`.
 #[derive(Parser)]
 #[command(name = "crap4rust", version, about, long_about = None)]
 pub struct Cli {
-    /// Path to an LCOV coverage file (as emitted by `cargo llvm-cov --lcov`).
+    /// Use an existing LCOV coverage file instead of running coverage.
+    ///
+    /// This is the bring-your-own-coverage seam: when it is given, no coverage
+    /// command is run at all (so `--test-command` is ignored). Without it,
+    /// coverage runs and is read back from `target/crap4rust/coverage.lcov`.
     #[arg(long, value_name = "PATH")]
-    lcov_path: PathBuf,
+    lcov_path: Option<PathBuf>,
+
+    /// Coverage command to run instead of `cargo llvm-cov`.
+    ///
+    /// Split on whitespace and executed directly — there is no shell, so
+    /// quoting, pipes and redirection are not supported, and a program or
+    /// argument containing spaces cannot be expressed. The literal token
+    /// `{lcov}` in any argument is replaced with the LCOV output path; unlike
+    /// crap4go's `{coverprofile}`, which expands to a whole flag, `{lcov}`
+    /// expands to a bare path and so needs its own flag in front of it (e.g.
+    /// `--output-path {lcov}`). A command with no `{lcov}` token must write
+    /// LCOV to `target/crap4rust/coverage.lcov` itself. The default command is
+    /// `cargo llvm-cov --lcov --output-path {lcov}`.
+    #[arg(long, value_name = "COMMAND")]
+    test_command: Option<String>,
 
     /// Rust source file, or directory to scan recursively for `.rs` files.
     #[arg(value_name = "PATH")]
     path: PathBuf,
+}
+
+/// A run's resolved inputs (FC-T7c): defaults and flag precedence are settled
+/// once, here, so [`run`] is exercisable without an argument parser.
+pub struct RunConfig {
+    /// Where the LCOV profile comes from, and whether it is ours to manage.
+    coverage: CoverageSource,
+    /// Advisory lines produced while resolving the coverage source (e.g. an
+    /// ignored `--test-command`). Advisory only: they never affect the exit
+    /// code (C6).
+    advisories: Vec<String>,
+    /// Rust source file or directory to analyse.
+    path: PathBuf,
+}
+
+impl RunConfig {
+    /// Resolve a run from plain inputs — no argument parser involved (FC-T7c).
+    ///
+    /// Where coverage comes from — including `--lcov-path` winning outright
+    /// over `--test-command` — is the coverage adapter's own policy, so it is
+    /// resolved by [`CoverageSource::resolve`] rather than restated here.
+    pub fn new(path: PathBuf, lcov_path: Option<PathBuf>, test_command: Option<&str>) -> Self {
+        let (coverage, advisories) = CoverageSource::resolve(lcov_path, test_command);
+        Self {
+            coverage,
+            advisories,
+            path,
+        }
+    }
+
+    /// Advisories about the resolved coverage inputs, to be emitted *before*
+    /// the run starts: a coverage command that will never run, or one that must
+    /// write LCOV itself, is worth saying before a long test run rather than
+    /// after it. Advisory only — they never affect the exit code (C6).
+    pub fn advisories(&self) -> &[String] {
+        &self.advisories
+    }
+}
+
+impl From<&Cli> for RunConfig {
+    /// Parsed arguments are just one source of the plain inputs
+    /// [`RunConfig::new`] resolves — there is no second resolution path.
+    fn from(cli: &Cli) -> Self {
+        Self::new(
+            cli.path.clone(),
+            cli.lcov_path.clone(),
+            cli.test_command.as_deref(),
+        )
+    }
 }
 
 /// Everything a run produces for the process to emit: the rendered report and
@@ -50,17 +122,19 @@ pub struct RunOutput {
 /// Run the pipeline and return the rendered "CRAP Report" (C14) plus any
 /// resolution diagnostics.
 ///
-/// Every failure here is an *operational* error (C6 ⇒ exit 1): unreadable or
-/// unparseable LCOV, a missing path, or a source file that does not parse.
-/// High-CRAP functions are **not** an error — they are simply reported, and
-/// neither is a fuzzy or missing coverage match: those are diagnosed, not
-/// failed.
-pub fn run(cli: &Cli) -> anyhow::Result<RunOutput> {
-    let lcov = coverage::load(&cli.lcov_path)
-        .with_context(|| format!("failed to load LCOV file {}", cli.lcov_path.display()))?;
+/// Every failure here is an *operational* error (C6 ⇒ exit 1): a coverage
+/// command that cannot be run or exits non-zero, unreadable or unparseable
+/// LCOV, a missing path, or a source file that does not parse. High-CRAP
+/// functions are **not** an error — they are simply reported, and neither is a
+/// fuzzy or missing coverage match: those are diagnosed, not failed.
+pub fn run(config: &RunConfig) -> anyhow::Result<RunOutput> {
+    let lcov_path = config.coverage.ensure_lcov()?;
+
+    let lcov = coverage::load(lcov_path)
+        .with_context(|| format!("failed to load LCOV file {}", lcov_path.display()))?;
 
     let mut units = Vec::new();
-    for file in discover_sources(&cli.path)? {
+    for file in discover_sources(&config.path)? {
         let src = fs::read_to_string(&file)
             .with_context(|| format!("failed to read source file {}", file.display()))?;
         let fns = complexity::analyze_str(&src)
@@ -133,6 +207,27 @@ fn discover_sources(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a config the way a caller with plain inputs does — no parser.
+    fn config(path: &str, lcov_path: Option<&str>, test_command: Option<&str>) -> RunConfig {
+        RunConfig::new(
+            PathBuf::from(path),
+            lcov_path.map(PathBuf::from),
+            test_command,
+        )
+    }
+
+    #[test]
+    fn parsed_arguments_resolve_the_same_way_as_plain_inputs() {
+        // `From<&Cli>` must be a thin adapter over `RunConfig::new`, not a
+        // second resolution path.
+        let cli = Cli::parse_from(["crap4rust", "--test-command", "my-tool --out {lcov}", "src"]);
+        let from_parser = RunConfig::from(&cli);
+        let from_plain = config("src", None, Some("my-tool --out {lcov}"));
+        assert_eq!(from_parser.coverage, from_plain.coverage);
+        assert_eq!(from_parser.advisories, from_plain.advisories);
+        assert_eq!(from_parser.path, from_plain.path);
+    }
 
     #[test]
     fn missing_path_is_an_error() {

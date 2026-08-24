@@ -80,7 +80,7 @@ One or more tasks per slice.
 | T5  | S1 | **Coverage join** — intersect fn `syn` span lines with LCOV covered/total → per-fn `cov`. | **Done** | vibe/001 |
 | T6  | S1 | **Table reporter** — header "CRAP Report", 5 columns, crap4go layout parity. | **Done** | vibe/001 |
 | T7  | S1 | **CLI skeleton** — arg parse, wire pipeline, `--lcov-path`. Also lands C15 (identity fields). | **Done** | vibe/001 |
-| T8  | S2 | **Coverage runner** — invoke `cargo llvm-cov` → default `target/crap4rust/coverage.lcov`; `--test-command` override; zero-config default (C2). Makes `--lcov-path` optional — `missing_required_lcov_arg_exits_one` legitimately changes (expected evolution, not a regression). | Pending | - |
+| T8  | S2 | **Coverage runner** — invoke `cargo llvm-cov` → default `target/crap4rust/coverage.lcov`; `--test-command` override; zero-config default (C2). Makes `--lcov-path` optional — `missing_required_lcov_arg_exits_one` legitimately changes (expected evolution, not a regression). | **Done** | vibe/001 |
 | T9  | S3 | **Workspace enumeration** — cargo metadata; per-member modules, crate-qualified (C3). Checklist: replace `report::rows_from_joined` module derivation (FC-T6a); move source discovery out of `cli.rs` into its adapter; FC-T5a longest-overlap + `Ambiguous` resolution; FC-T5e `SourceUnit` refactor. | Pending | - |
 | T10 | S3 | **Product/test filtering** — exclude `#[cfg(test)]`/`#[test]`; `tests/`/`benches/`/`examples/` non-product; positional path-fragment filters (C5). | Pending | - |
 | T11 | S4 | **JSON reporter** — versioned schema (`schema_version`), stable field contract. | Pending | - |
@@ -131,6 +131,84 @@ One or more tasks per slice.
 - **D7** — Incremental/cached CC across runs.
 
 ## Notes & Decisions
+### C17 — `--test-command` contract & crap4go divergences — **RESOLVED (human, 2026-08-24)**
+
+Source-verified against `unclebob/crap4go` @ `bee16db` (`internal/cli/cli.go`, `cmd/crap4go/main.go`,
+`internal/coverage/coverage.go`). crap4go **does** have `--test-command`, but it is **not** what an
+earlier documentation-only reading suggested — three deliberate divergences, all human-ruled:
+
+1. **argv, not a shell.** crap4go's `coverageCommand` returns `exec.Command("sh", "-c", command)` —
+   the whole string goes to a POSIX shell (quoting/pipes/redirection work there) and it is
+   **Unix-only**. crap4rust whitespace-splits into argv with **no shell**: our CI gates on
+   `windows-latest`, where `sh -c` does not exist. Cost: a program or argument **containing spaces is
+   inexpressible** (see FC-T8f). `strings.Fields` appears nowhere in crap4go's command path.
+2. **`{lcov}` expands to a bare path**, where crap4go's `{coverprofile}` expands to the **whole flag**
+   (`-coverprofile=…`). A ported command mis-translates silently, so `--help` states the contrast
+   explicitly and T13 must carry a migration note.
+3. **Artifact required.** After a zero-exit coverage command we require the LCOV file and exit `1`
+   otherwise. crap4go's `LoadProfile` returns `nil, nil` on a missing file — silently yielding an
+   empty profile, 0% everywhere, and a confidently inflated report. Our stricter behaviour is a
+   deliberate correctness improvement.
+
+**Confirmed parity:** token-absent append is crap4go behaviour (we diverge per (3) — we run verbatim
+and require the artifact rather than appending llvm-cov-specific flags; human-ruled). **Confirmed
+addition:** crap4go has **no `--lcov-path` analogue**, so our precedence rule is parity-unconstrained.
+
+**Precedence (human ruling):** `--lcov-path` wins over `--test-command`, decided **at the type level**
+(`CoverageSource::Existing` ⇒ the runner is genuinely unreachable) — not a clap `conflicts_with`,
+which would break the CI wrapper pattern. An **advisory** stderr line says `--test-command` was
+ignored. A `--test-command` with no `{lcov}` token warns **upfront, before spawning**, rather than
+failing five minutes later. Advisories never affect the exit code (C6).
+
+### T8 review notes (Anders — approve-with-suggestions ×2, 2026-08-24)
+
+T8 (`src/runner.rs` + `RunConfig`) opens **S2**. Bhaskar FAIL → fix → PASS → FAIL → fix → **PASS**
+(88 tests: 72 lib + 16 CLI integration). He caught a **silently-wrong-answer bug**: zero-config
+accepted a **stale** `target/crap4rust/coverage.lcov` from an earlier run and reported it as current.
+Now impossible — `generate_coverage` clears the artifact before spawning and **requires** it after.
+He also caught a weakened test assertion (`contains("error: ")`) that the spawned clap child satisfied
+on its own; now three components matched by byte offset with ordering asserted.
+
+Design shape: `enum CoverageSource { Existing(PathBuf), Generated{command, artifact} }` encodes
+**ownership** of the LCOV file, making "never delete the user's BYO file" a **type-level** property
+rather than a runtime `if`. `GeneratedArtifact(PathBuf)` (private field, `clear()` the sole removal
+path, constructible only in the `Generated` arm) means an `Existing` path is not type-compatible with
+the deletion code. Artifact lifecycle lives in `runner`, not the composition root —
+`fs::remove_file` never shares a module with the CLI. `run_with(cmd, spawn)` closure injection keeps
+every test off a real `cargo llvm-cov`. `RunConfig::new` is parser-independent (FC-T7c discharged).
+
+Forward constraints:
+- **FC-T8a (artifact ownership is type-level).** Only `CoverageSource::Generated` may construct a
+  `GeneratedArtifact`; `clear()` stays the sole removal path, private to `runner`. Any future flag
+  naming an output location routes through `GeneratedArtifact` or gets no deletion rights. A
+  user-supplied path is never deleted, ever.
+- **FC-T8b (no real coverage tool in tests).** The injected `spawn` is the only way the failure
+  taxonomy is asserted. Never invoke real `cargo llvm-cov` from a test (slow, environment-dependent,
+  flaky — golden rule #8). CI runs ubuntu-latest **and** windows-latest.
+- **FC-T8c (precedence stays type-level).** Decided once in `CoverageSource::resolve` and expressed by
+  which variant is built — never re-checked downstream. The ignored-`--test-command` advisory is
+  emitted, never escalated to an error (C6).
+- **FC-T8d (divergence register).** See C17 — `--test-command` is **not** parity; record it as such,
+  and do not let T13 claim otherwise.
+- **FC-T8e (artifact path is ours).** `target/crap4rust/` is tool-owned, created by us, never assumed
+  created by the coverage command. **T9:** once workspace roots are enumerated, decide one shared
+  artifact vs per-root — a single `DEFAULT_LCOV_PATH` across roots lets later roots clobber earlier.
+  Coverage is **workspace-wide, one run per invocation** (`cargo llvm-cov` is workspace-aware);
+  discovery goes per-member, coverage generation does not.
+- **FC-T8f (argv escape hatch — PROMOTED, needs a human scope call).** Repeatable
+  `--test-command-arg` (one argv element per occurrence, no splitting, `{lcov}` still substituted,
+  mutually exclusive with `--test-command`) is the sanctioned answer to spaces-in-paths — the gap
+  bites hardest on Windows, the very platform we chose argv for. **Land it before S2 closes, or T13
+  documents "no spaces in `--test-command`" as a known limit.** A shell variant (`sh -c`/`cmd /c`) is
+  **rejected**: platform-split, injection surface, untestable on half the CI matrix.
+- **FC-T8g (advisory carrier; binds FC-T7e).** `RunConfig::advisories()` is pre-rendered
+  `Vec<String>`, stderr-only, and **must be drained by every entrypoint before calling `cli::run`** —
+  `main` does; a T11 JSON frontend must too, or resolution warnings vanish. Advisories are facts about
+  **configuration** (known at resolution time, must survive `Err`); `RunOutput.diagnostics` are facts
+  about the **run** (only exist on `Ok`) — hence the deliberate split, with FC-T7b intact. If T11 rules
+  warnings belong inside the JSON document, `advisories` **and** `diagnostics` convert to a structured
+  type **together**, before `schema_version` freezes. Do not convert one alone.
+
 ### C16 — Bidirectional path matching — **DELIBERATE DIVERGENCE (verified, 2026-08-24)**
 
 crap4go's `suffixMatch` (`internal/coverage/coverage.go`, `unclebob/crap4go` @ `bee16db`) is

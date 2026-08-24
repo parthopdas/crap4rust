@@ -14,7 +14,7 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use crap4rust::cli::{self, Cli};
+use crap4rust::cli::{self, Cli, RunConfig};
 
 /// Operational-error exit code (C6).
 const FAILURE: u8 = 1;
@@ -34,7 +34,15 @@ fn main() -> ExitCode {
         }
     };
 
-    match cli::run(&cli) {
+    let config = RunConfig::from(&cli);
+    // Emitted before the run so a coverage command that will never run, or one
+    // that must write LCOV itself, is flagged up front rather than after a long
+    // test run. Advisory only — never an exit-code effect (C6).
+    for advisory in config.advisories() {
+        eprintln!("{advisory}");
+    }
+
+    match cli::run(&config) {
         Ok(output) => {
             // Advisory only — diagnostics never change the exit code (C6).
             for diagnostic in &output.diagnostics {
