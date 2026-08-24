@@ -20,7 +20,10 @@ use syn::visit::{self, Visit};
 /// Cyclomatic complexity plus source span for a single analysed function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FunctionComplexity {
-    /// Simple (unqualified) function name. Full identity/naming is task T2.
+    /// Qualified display name assembled from enclosing context: module path for
+    /// free/nested `fn`s (`bar::foo`), `Type::method` for inherent impls,
+    /// `<Type as Trait>::method` for trait impls, and `Trait::method` for
+    /// provided trait methods. Cross-crate qualification is task T9.
     pub(crate) name: String,
     /// Cyclomatic complexity: base 1 plus one per decision point.
     pub(crate) complexity: u32,
@@ -45,44 +48,149 @@ pub(crate) fn analyze_str(src: &str) -> syn::Result<Vec<FunctionComplexity>> {
 pub(crate) fn analyze_file(file: &syn::File) -> Vec<FunctionComplexity> {
     let mut collector = FnCollector {
         results: Vec::new(),
+        ctx: Vec::new(),
     };
     collector.visit_file(file);
     collector.results
 }
 
+/// One frame of enclosing context, pushed/popped as the visitor descends so a
+/// recorded function can assemble its qualified name.
+enum Ctx {
+    /// `mod <name>` — contributes a module-path segment.
+    Mod(String),
+    /// `impl <self_ty>` or `impl <trait_path> for <self_ty>`.
+    Impl {
+        self_ty: String,
+        trait_path: Option<String>,
+    },
+    /// `trait <name>` — the receiver for its provided methods.
+    Trait(String),
+}
+
 /// Walks the whole AST recording one [`FunctionComplexity`] per function
 /// definition. Recursion continues into each function body so that nested `fn`
-/// items are recorded as their own functions.
+/// items are recorded as their own functions. A context stack ([`Ctx`]) tracks
+/// enclosing `mod`/`impl`/`trait` frames to build qualified names.
 struct FnCollector {
     results: Vec<FunctionComplexity>,
+    ctx: Vec<Ctx>,
 }
 
 impl FnCollector {
-    fn record(&mut self, name: &syn::Ident, block: &syn::Block, span: proc_macro2::Span) {
+    fn record(&mut self, name: String, block: &syn::Block, span: proc_macro2::Span) {
         self.results.push(FunctionComplexity {
-            name: name.to_string(),
+            name,
             complexity: complexity_of_block(block),
             start_line: span.start().line,
             end_line: span.end().line,
         });
     }
+
+    /// Enclosing module-path segments (impl/trait frames excluded).
+    fn module_segments(&self) -> Vec<String> {
+        self.ctx
+            .iter()
+            .filter_map(|c| match c {
+                Ctx::Mod(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Receiver prefix for a method, taken from the innermost `impl`/`trait`
+    /// frame (always the immediate parent of a method item).
+    fn method_receiver(&self) -> Option<String> {
+        match self.ctx.last() {
+            Some(Ctx::Impl {
+                self_ty,
+                trait_path: Some(trait_path),
+            }) => Some(format!("<{self_ty} as {trait_path}>")),
+            Some(Ctx::Impl {
+                self_ty,
+                trait_path: None,
+            }) => Some(self_ty.clone()),
+            Some(Ctx::Trait(name)) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    /// Qualified name for a free/nested `fn`: module path plus its own name.
+    fn free_name(&self, ident: &syn::Ident) -> String {
+        let mut segs = self.module_segments();
+        segs.push(ident.to_string());
+        segs.join("::")
+    }
+
+    /// Qualified name for an impl/trait method: module path, receiver, own name.
+    fn method_name(&self, ident: &syn::Ident) -> String {
+        let mut segs = self.module_segments();
+        segs.extend(self.method_receiver());
+        segs.push(ident.to_string());
+        segs.join("::")
+    }
+}
+
+/// Render a `syn::Path` as `seg::seg`, dropping generic arguments/lifetimes.
+fn path_name(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|seg| seg.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+/// Render an `impl` self-type as a clean name, stripping generics/lifetimes and
+/// peeling references so `impl Foo<T>`/`impl &Foo` both read as `Foo`.
+fn self_type_name(ty: &syn::Type) -> String {
+    match ty {
+        syn::Type::Path(tp) => path_name(&tp.path),
+        syn::Type::Reference(r) => self_type_name(&r.elem),
+        syn::Type::Group(g) => self_type_name(&g.elem),
+        syn::Type::Paren(p) => self_type_name(&p.elem),
+        _ => "_".to_string(),
+    }
 }
 
 impl<'ast> Visit<'ast> for FnCollector {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        self.ctx.push(Ctx::Mod(node.ident.to_string()));
+        visit::visit_item_mod(self, node);
+        self.ctx.pop();
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        self.ctx.push(Ctx::Impl {
+            self_ty: self_type_name(&node.self_ty),
+            trait_path: node.trait_.as_ref().map(|(_, path, _)| path_name(path)),
+        });
+        visit::visit_item_impl(self, node);
+        self.ctx.pop();
+    }
+
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        self.ctx.push(Ctx::Trait(node.ident.to_string()));
+        visit::visit_item_trait(self, node);
+        self.ctx.pop();
+    }
+
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        self.record(&node.sig.ident, &node.block, node.span());
+        let name = self.free_name(&node.sig.ident);
+        self.record(name, &node.block, node.span());
         visit::visit_item_fn(self, node);
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        self.record(&node.sig.ident, &node.block, node.span());
+        let name = self.method_name(&node.sig.ident);
+        self.record(name, &node.block, node.span());
         visit::visit_impl_item_fn(self, node);
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
         // Only provided (default-bodied) trait methods have a function to measure.
         if let Some(block) = &node.default {
-            self.record(&node.sig.ident, block, node.span());
+            let name = self.method_name(&node.sig.ident);
+            self.record(name, block, node.span());
             visit::visit_trait_item_fn(self, node);
         }
     }
@@ -395,17 +503,20 @@ mod tests {
         "#;
         let fns = analyze_str(src).expect("parses");
         // `required` has no body → not measured.
-        assert!(fns.iter().all(|f| f.name != "required"));
+        assert!(fns.iter().all(|f| f.name != "T::required"));
         assert_eq!(
             fns.iter()
-                .find(|f| f.name == "provided")
+                .find(|f| f.name == "T::provided")
                 .unwrap()
                 .complexity,
             2
         );
         // match with one real arm + one catch-all → base 1 + 1 = 2.
         assert_eq!(
-            fns.iter().find(|f| f.name == "method").unwrap().complexity,
+            fns.iter()
+                .find(|f| f.name == "S::method")
+                .unwrap()
+                .complexity,
             2
         );
     }
@@ -462,5 +573,126 @@ mod tests {
         let b = fns.iter().find(|f| f.name == "b").unwrap();
         assert_eq!((a.start_line, a.end_line), (1, 1));
         assert_eq!((b.start_line, b.end_line), (3, 5));
+    }
+
+    #[test]
+    fn qualified_names_track_enclosing_context() {
+        struct Case {
+            src: &'static str,
+            expected: &'static str,
+        }
+
+        let cases = [
+            // Free fn at crate root → bare name.
+            Case {
+                src: "fn foo() {}",
+                expected: "foo",
+            },
+            // Free fn inside a nested module → module-path qualified.
+            Case {
+                src: "mod bar { fn foo() {} }",
+                expected: "bar::foo",
+            },
+            // Inherent impl method → Type::method.
+            Case {
+                src: "struct Foo; impl Foo { fn bar(&self) {} }",
+                expected: "Foo::bar",
+            },
+            // Trait-impl method → <Type as Trait>::method.
+            Case {
+                src: "struct Foo; trait Tr { fn bar(&self); } impl Tr for Foo { fn bar(&self) {} }",
+                expected: "<Foo as Tr>::bar",
+            },
+            // Provided (default-bodied) trait method → Trait::method.
+            Case {
+                src: "trait T { fn m(&self) {} }",
+                expected: "T::m",
+            },
+            // Module + impl combine → m::Type::method.
+            Case {
+                src: "mod m { struct Foo; impl Foo { fn bar(&self) {} } }",
+                expected: "m::Foo::bar",
+            },
+            // Generics on the self-type are stripped for a clean name.
+            Case {
+                src: "struct Foo<T>(T); impl<T> Foo<T> { fn bar(&self) {} }",
+                expected: "Foo::bar",
+            },
+        ];
+
+        for case in cases {
+            let fns = analyze_str(case.src).expect("source should parse");
+            assert!(
+                fns.iter().any(|f| f.name == case.expected),
+                "expected name {:?} among {:?}",
+                case.expected,
+                fns.iter().map(|f| f.name.as_str()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn nested_fn_is_qualified_by_module_only() {
+        // At crate root: nested fn keeps only its own name (parent fn excluded).
+        let fns = analyze_str("fn outer() { fn inner() {} }").expect("parses");
+        assert!(fns.iter().any(|f| f.name == "outer"));
+        assert!(fns.iter().any(|f| f.name == "inner"));
+
+        // Inside a module: module-qualified, parent fn name still excluded.
+        let fns = analyze_str("mod m { fn outer() { fn inner() {} } }").expect("parses");
+        assert!(fns.iter().any(|f| f.name == "m::outer"));
+        assert!(fns.iter().any(|f| f.name == "m::inner"));
+
+        // Inside an impl method: qualified by module path only, not the impl type.
+        let fns = analyze_str("struct Foo; impl Foo { fn bar(&self) { fn inner() {} } }")
+            .expect("parses");
+        assert!(fns.iter().any(|f| f.name == "Foo::bar"));
+        assert!(fns.iter().any(|f| f.name == "inner"));
+    }
+
+    #[test]
+    fn sibling_contexts_do_not_leak_names() {
+        // Guards the push/visit/pop invariant: after visiting one frame, its
+        // segment must be popped before the sibling is visited — no leakage.
+        let fns = analyze_str("mod a { fn f() {} } mod b { fn f() {} }").expect("parses");
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"a::f"), "expected a::f among {names:?}");
+        assert!(names.contains(&"b::f"), "expected b::f among {names:?}");
+
+        let fns =
+            analyze_str("struct A; struct B; impl A { fn m(&self) {} } impl B { fn m(&self) {} }")
+                .expect("parses");
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"A::m"), "expected A::m among {names:?}");
+        assert!(names.contains(&"B::m"), "expected B::m among {names:?}");
+    }
+
+    #[test]
+    fn multi_level_module_nesting_accumulates_all_segments() {
+        // Pins multi-frame accumulation and pop ordering across nested modules.
+        let fns = analyze_str("mod a { mod b { fn f() {} } }").expect("parses");
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            names.contains(&"a::b::f"),
+            "expected a::b::f among {names:?}"
+        );
+    }
+
+    #[test]
+    fn or_pattern_arm_counts_once_not_per_alternative() {
+        // The or-pattern arm `1 | 2 | 3` counts +1 for the arm (NOT +1 per
+        // alternative); `_` is exempt → base 1 + 1 = 2.
+        assert_eq!(
+            cc("fn f(x: i32) -> i32 { match x { 1 | 2 | 3 => 0, _ => 1 } }"),
+            2
+        );
+    }
+
+    #[test]
+    fn async_fn_await_adds_nothing() {
+        // Source-level analysis (C12): `.await` is not a decision point, so only
+        // the `if` counts → base 1 + 1 = 2.
+        let src = "async fn f(x: i32) -> i32 { if x > 0 { g().await } else { 0 } }";
+        assert_eq!(cc(src), 2);
     }
 }

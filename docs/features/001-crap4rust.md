@@ -74,7 +74,7 @@ One or more tasks per slice.
 | #   | Slice | Task | Status  | Commit |
 |-----|-------|------|---------|--------|
 | T1  | S1 | **CC engine (`syn` visitor)** — walk items/exprs, apply C1 rules; attribute closure decisions to enclosing fn. _Assumes source-level only._ | **Done** | vibe/001 |
-| T2  | S1 | **Fn identity/naming** — `<Type as Trait>::method` form; free fns, impl methods, closures folded into parent (C4). | Pending | - |
+| T2  | S1 | **Fn identity/naming** — `<Type as Trait>::method` form; free fns, impl methods, closures folded into parent (C4). | **Done** | vibe/001 |
 | T3  | S1 | **LCOV reader** — parse `DA` records → per-file line-hit map. | Pending | - |
 | T4  | S1 | **CRAP domain** — `crap(cc, cov)`; band classifier (1–5 / 5–30 / 30+), independent of `--threshold` (C11). Pure, no I/O. | Pending | - |
 | T5  | S1 | **Coverage join** — intersect fn `syn` span lines with LCOV covered/total → per-fn `cov`. | Pending | - |
@@ -131,6 +131,24 @@ One or more tasks per slice.
 - **D7** — Incremental/cached CC across runs.
 
 ## Notes & Decisions
+
+### T2 review notes (Anders — approve-with-suggestions, 2026-08-24)
+
+T2 (function identity/naming via a context stack on `FnCollector`) passed Bhaskar (full gate, 12 tests)
+and Anders' review. Forward constraints recorded for later tasks:
+
+- **Join keys on `(file, span)`, NOT on `name`.** Function names are **presentation-only** and can
+  collide (e.g. `impl Foo<u8>`/`impl Foo<u16>` both render `Foo::bar`; alias vs fully-qualified trait
+  paths). T5's coverage join and any aggregation/dedup MUST key on `(file, span)` so distinct functions
+  never collapse. (Pinned as a T5 constraint.)
+- **T9 crate/file-module qualification** — the current `name` is **file-local**: it reflects only
+  inline `mod {}` blocks, not file-based modules (`src/foo/bar.rs` ⇒ `foo::bar`). T9 must *prepend* the
+  crate + file-path module prefix on top of this; it must not assume the name is already crate-relative.
+- **`node.span()` includes attributes/doc-comments** so `start_line` may sit above the body — harmless
+  for the join (attribute lines carry no LCOV `DA` records). Do not narrow the span "fix" this later.
+- **Open product decision (T6/T9 reporter/UX):** how to disambiguate genuinely-distinct functions that
+  render to the same display name — include generic args, append `file:line`, or accept duplicate-named
+  rows. Deferred to the reporter tasks; flagged for the human.
 
 ### T1 review notes (Anders — approve-with-suggestions, 2026-08-24)
 
