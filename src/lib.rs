@@ -8,3 +8,4 @@ mod complexity;
 mod coverage;
 mod crap;
 mod join;
+mod report;

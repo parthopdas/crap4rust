@@ -78,7 +78,7 @@ One or more tasks per slice.
 | T3  | S1 | **LCOV reader** — parse `DA` records → per-file line-hit map. | **Done** | vibe/001 |
 | T4  | S1 | **CRAP domain** — `crap(cc, cov)`; band classifier (1–5 / 5–30 / 30+), independent of `--threshold` (C11). Pure, no I/O. | **Done** | vibe/001 |
 | T5  | S1 | **Coverage join** — intersect fn `syn` span lines with LCOV covered/total → per-fn `cov`. | **Done** | vibe/001 |
-| T6  | S1 | **Table reporter** — header "CRAP Report", 5 columns, crap4go layout parity. | Pending | - |
+| T6  | S1 | **Table reporter** — header "CRAP Report", 5 columns, crap4go layout parity. | **Done** | vibe/001 |
 | T7  | S1 | **CLI skeleton** — arg parse, wire pipeline, `--lcov-path`. | Pending | - |
 | T8  | S2 | **Coverage runner** — invoke `cargo llvm-cov` → default `target/crap4rust/coverage.lcov`; `--test-command` override; zero-config default (C2). | Pending | - |
 | T9  | S3 | **Workspace enumeration** — cargo metadata; per-member modules, crate-qualified (C3). | Pending | - |
@@ -131,6 +131,41 @@ One or more tasks per slice.
 - **D7** — Incremental/cached CC across runs.
 
 ## Notes & Decisions
+### T6 review notes (Anders — approve-with-suggestions, 2026-08-24)
+
+T6 (`src/report.rs`: `ReportRow{name,module,complexity,coverage,crap}`, pure
+`format_report(&[ReportRow])->String`, adapter `rows_from_joined`, placeholder `module_from_path`)
+passed Bhaskar's full gate (45 tests, fmt/clippy/build/test clean) and Anders' design review. C14
+layout is byte-locked by 9 tests (Go `%-30s %-35s %4s %7s %8s`; 88-char header/separator; overflow, no
+truncation; `   N/A ` / `     N/A`; CRAP desc, `None` last, name-asc tie-break via `total_cmp`).
+
+Assumptions recorded (Dave): module is an **opaque string supplied to the reporter** — the reporter
+never derives crate identity (S3/T9 swaps the adapter, not the formatter); `module_from_path` is an
+explicit S1 placeholder (path normalized, `\`→`/`, `./` stripped); trailing in-cell whitespace kept
+for parity; empty input still emits the 4 preamble lines; no band column (FC-T6 honored).
+
+Forward constraints:
+- **FC-T6a (schema freeze ordering).** `schema_version` must NOT be frozen while `module` is the path
+  placeholder — **T9 is a hard predecessor of T11.** Add "replace `report::rows_from_joined` module
+  derivation" to T9's checklist.
+- **FC-T6b (parallel determinism).** `compare` is total except when CRAP **and** name both tie
+  (the duplicate-display-name case). T12 must preserve input ordering — order-preserving rayon
+  `map`/`collect`, never `par_bridge` or iteration over a `HashMap`; sort source units first.
+- **FC-T6c (JSON row seam).** `ReportRow` drops `file`. Before T11, either carry `file` on `ReportRow`
+  or rule that the JSON row derives from `JoinedFunction` — leaving it undecided forks the seam.
+- **FC-T6d (shared ordering).** T11 must reuse C14 ordering, not copy `compare`; hoist to a shared
+  helper or have T7 sort once and hand both reporters a pre-ordered slice.
+- **FC-T6e (T7 printing).** `format_report` output is fully newline-terminated — T7 uses `print!`,
+  not `println!`.
+- **FC-T6f (band coloring, S5).** Bands arrive as ANSI color on existing cells only — never an extra
+  column or width change, or the C14-locked tests break.
+
+**Open for the human — same-display-name disambiguation (FC-T5d).** Duplicate-looking rows are
+emitted today. Anders' recommendation (human decides): additively carry `file` + `start_line` through
+`JoinedFunction`→`ReportRow` **at T7** (during the `allow(dead_code)` audit), keep the v1 table
+unchanged, document as a T13 limit — hard deadline **before T11**, since a JSON array with no stable
+identity key would freeze a contract defect into `schema_version`.
+
 ### T4 review notes (Anders — approve-with-suggestions, 2026-08-24)
 
 T4 (`src/crap.rs`: pure `crap(cc:u32,cov:f64)->f64`, `score(cc,Option<f64>)->Option<f64>`,
