@@ -19,7 +19,10 @@
 //!
 //! Consumed by the coverage join (T5) and reporter (T6); until the pipeline is
 //! wired it is exercised only by unit tests, so `dead_code` is allowed here.
-//! **Remove this `allow` on T5/T7** once the pipeline uses the module.
+//! `crap`/`score` go live once the pipeline is wired (T5/T6/T7), but
+//! **`band`/`RiskBand` stay unused until S5 (display-band coloring)** — so this
+//! module-level allow (or, equivalently, a targeted `#[allow(dead_code)]` on
+//! `band`/`RiskBand`) must **stay until S5**, not be removed at T5/T7 (FC-T4a).
 #![allow(dead_code)]
 
 /// Fixed display bands for a CRAP score (C11). Report-only; independent of any

@@ -15,7 +15,8 @@
 //!
 //! Consumed by the coverage join (T5) and CLI wiring (T7); until then it is
 //! exercised only by unit tests, so `dead_code` is allowed here.
-//! **Remove this `allow` on T5/T7** once the pipeline uses the module.
+//! **Remove this `allow` when T7 wires the CLI** and the pipeline actually
+//! calls these items.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
@@ -56,6 +57,40 @@ impl LcovData {
     /// Line-hit map for `file`, if the LCOV data contains a section for it.
     pub(crate) fn file(&self, file: &str) -> Option<&BTreeMap<u32, u64>> {
         self.files.get(file)
+    }
+
+    /// Resolve a query path (a CC-engine source path) to the LCOV key that
+    /// covers it, mirroring crap4go's `segmentsForFile`. Returns the matching
+    /// **stored** key (to be fed back into [`coverage_in_range`]), or `None`
+    /// when the file is genuinely absent from the coverage profile.
+    ///
+    /// Matching is path-separator- and `./`-insensitive (see [`normalize_path`]):
+    /// 1. exact match on normalized keys; else
+    /// 2. segment-wise **suffix** match — the shorter path's `/`-segments are a
+    ///    suffix of the longer's (either direction), e.g. `src/lib.rs` resolves
+    ///    an absolute `/abs/proj/src/lib.rs` key and vice-versa.
+    ///
+    /// The raw key map stays private; the join owns this key space, so the
+    /// normalization lives here rather than leaking the inner `BTreeMap`.
+    pub(crate) fn resolve_path(&self, path: &str) -> Option<&str> {
+        let query = normalize_path(path);
+        // 1. Exact match on normalized keys (an exact hit wins over a partial
+        //    suffix hit, which is why this pass is kept separate).
+        for key in self.files.keys() {
+            if normalize_path(key) == query {
+                return Some(key.as_str());
+            }
+        }
+        // 2. Segment-wise suffix match.
+        let query_segs = segments(&query);
+        for key in self.files.keys() {
+            let key_norm = normalize_path(key);
+            let key_segs = segments(&key_norm);
+            if is_suffix(&query_segs, &key_segs) {
+                return Some(key.as_str());
+            }
+        }
+        None
     }
 
     /// Coverage over the inclusive line range `[start_line, end_line]` of `file`.
@@ -163,6 +198,25 @@ fn parse_da(rest: &str) -> Option<(u32, u64)> {
     let line_no = parts.next()?.parse::<u32>().ok()?;
     let hits = parts.next()?.parse::<u64>().ok()?;
     Some((line_no, hits))
+}
+
+/// Normalize a path for cross-side matching (crap4go `normalizePath`): convert
+/// Windows separators `\` → `/`, then strip a single leading `./`.
+fn normalize_path(path: &str) -> String {
+    let slashed = path.replace('\\', "/");
+    slashed.strip_prefix("./").unwrap_or(&slashed).to_string()
+}
+
+/// Split an (already-normalized) path into its non-empty `/`-segments.
+fn segments(path: &str) -> Vec<&str> {
+    path.split('/').filter(|s| !s.is_empty()).collect()
+}
+
+/// crap4go `suffixMatch`: the shorter segment list is a suffix of the longer
+/// (either direction). Empty lists never match.
+fn is_suffix(a: &[&str], b: &[&str]) -> bool {
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    !short.is_empty() && long.ends_with(short)
 }
 
 #[cfg(test)]

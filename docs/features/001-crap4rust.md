@@ -77,7 +77,7 @@ One or more tasks per slice.
 | T2  | S1 | **Fn identity/naming** — `<Type as Trait>::method` form; free fns, impl methods, closures folded into parent (C4). | **Done** | vibe/001 |
 | T3  | S1 | **LCOV reader** — parse `DA` records → per-file line-hit map. | **Done** | vibe/001 |
 | T4  | S1 | **CRAP domain** — `crap(cc, cov)`; band classifier (1–5 / 5–30 / 30+), independent of `--threshold` (C11). Pure, no I/O. | **Done** | vibe/001 |
-| T5  | S1 | **Coverage join** — intersect fn `syn` span lines with LCOV covered/total → per-fn `cov`. | Pending | - |
+| T5  | S1 | **Coverage join** — intersect fn `syn` span lines with LCOV covered/total → per-fn `cov`. | **Done** | vibe/001 |
 | T6  | S1 | **Table reporter** — header "CRAP Report", 5 columns, crap4go layout parity. | Pending | - |
 | T7  | S1 | **CLI skeleton** — arg parse, wire pipeline, `--lcov-path`. | Pending | - |
 | T8  | S2 | **Coverage runner** — invoke `cargo llvm-cov` → default `target/crap4rust/coverage.lcov`; `--test-command` override; zero-config default (C2). | Pending | - |
@@ -151,6 +151,40 @@ Forward constraints to honor:
   `debug_assert!` could be added to `crap()` later).
 - **FC-T6 (no band column).** T6's table is C14's 5 columns only (Function·Module·CC·Cov%·CRAP);
   `band()` is NOT a T6 dependency — do not wire it into the reporter table.
+
+### T5 review notes (Anders — approve-with-suggestions, 2026-08-24)
+
+T5 (pure `join` module + `resolve_path` path resolution on `LcovData`) passed Bhaskar (full gate, 36
+tests) and Anders' design review. C13 contract, layering, and forward-fit all confirmed. Forward
+constraints:
+
+- **FC-T5a (T9 — collision guard).** Bidirectional suffix match returns the lexicographically-first
+  `BTreeMap` key among candidates — silent/arbitrary under cross-member filename collisions
+  (`src/lib.rs`, `mod.rs`). Before workspace support, replace first-match with **longest-overlap
+  preference**; treat a genuine tie as **ambiguous ⇒ diagnostic + unresolved (N/A)**, not a silent pick.
+  **S1 is immune (single crate); this is a T9 gate.** Bidirectional itself is correct (LCOV keys are
+  short/relative, CC paths may be absolute — one-directional would miss and yield N/A everywhere); keep
+  it.
+- **FC-T5b (T7 — observable resolution).** When a file resolves via **non-exact** suffix match, or fails
+  to resolve, emit a stderr diagnostic (no effect on exit code — C6). Discharges the original
+  "silent + dangerous" objection once the CLI provides the channel.
+- **FC-T5c (T6 — Cov% of `total==0`).** A `total==0 ⇒ Some(1.0)` fn renders `100.0%`, indistinguishable
+  from genuine full coverage. Intended per C13(b); T6 just confirms no desire to mark it distinctly. No
+  join change.
+- **FC-T5d (T6 — line hedge).** If same-display-name disambiguation lands on `file:line`,
+  `JoinedFunction` must carry the source line; consider adding `start_line` now to avoid rework.
+- **FC-T5e (T9 — input shape).** `&[(String, Vec<FunctionComplexity>)]` carries no package identity; C3
+  crate-qualified Module needs it. Thread package context additively (or promote the tuple to a named
+  `SourceUnit`) without disturbing `resolve_path`.
+- **FC-T5f (docs — parity claim).** Reconcile the `is_suffix`/`resolve_path` "mirrors crap4go" comment
+  vs the note that crap4go is one-directional: verify crap4go's `segmentsForFile`/`suffixMatch`, and if
+  it differs, keep the bidirectional **behavior** but record it as a deliberate divergence (like C13) —
+  don't leave a false parity claim in the source. Reconcile before T9/merge.
+
+Consistency confirmed: `join.rs`'s `#![allow(dead_code)]` "remove at T7" is correct (whole surface
+test-only, no band-like S5 holdout — differs from `crap.rs`'s FC-T4a targeted keep). C13, FC-T3
+(`try_from…unwrap_or(u32::MAX)`), FC-T4b invariant (`total==0` short-circuits before division ⇒ no
+NaN/out-of-range) all faithfully encoded. No code changes requested.
 
 ### T3 review notes (Anders — approve-with-suggestions, 2026-08-24)
 
