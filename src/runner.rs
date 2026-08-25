@@ -32,6 +32,8 @@ use std::process::{Command, Output};
 use anyhow::{bail, Context};
 use thiserror::Error;
 
+use crate::diagnostic::{Diagnostic, Kind};
+
 /// The token replaced with the LCOV output path in a `--test-command` spec.
 const LCOV_PLACEHOLDER: &str = "{lcov}";
 
@@ -202,15 +204,12 @@ impl CoverageSource {
     pub(crate) fn resolve(
         lcov_path: Option<PathBuf>,
         test_command: Option<&str>,
-    ) -> (Self, Vec<String>) {
+    ) -> (Self, Vec<Diagnostic>) {
         let mut advisories = Vec::new();
         let source = match lcov_path {
             Some(lcov_path) => {
                 if test_command.is_some() {
-                    advisories.push(
-                        "warning: --lcov-path given; --test-command ignored, no coverage command was run"
-                            .to_string(),
-                    );
+                    advisories.push(Diagnostic::config(Kind::IgnoredTestCommand));
                 }
                 Self::Existing(lcov_path)
             }
@@ -222,11 +221,10 @@ impl CoverageSource {
                     .and_then(|spec| CoverageCommand::parse(spec, artifact.path()))
                     .unwrap_or_else(|| CoverageCommand::cargo_llvm_cov(artifact.path()));
                 if test_command.is_some_and(|spec| !spec.contains(LCOV_PLACEHOLDER)) {
-                    advisories.push(format!(
-                        "warning: --test-command has no {LCOV_PLACEHOLDER} token; \
-                         it must itself write LCOV to {}",
-                        artifact.path().display()
-                    ));
+                    advisories.push(Diagnostic::config(Kind::TestCommandWithoutLcovToken {
+                        token: LCOV_PLACEHOLDER,
+                        artifact: artifact.path().display().to_string(),
+                    }));
                 }
                 Self::Generated { command, artifact }
             }
@@ -318,6 +316,7 @@ fn run_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostic::Phase;
     use std::path::PathBuf;
     use std::process::ExitStatus;
 
@@ -427,8 +426,11 @@ mod tests {
             CoverageSource::resolve(Some(PathBuf::from("mine.lcov")), Some("my-tool"));
         assert_eq!(source, CoverageSource::Existing(PathBuf::from("mine.lcov")));
         assert_eq!(advisories.len(), 1, "{advisories:?}");
+        // A *config*-phase fact (FC-T8g): known before anything is spawned, and
+        // therefore emitted before the run rather than with the run's own.
+        assert_eq!(advisories[0].phase, Phase::Config);
         assert!(
-            advisories[0].contains("--test-command ignored"),
+            advisories[0].to_string().contains("--test-command ignored"),
             "{advisories:?}"
         );
     }
@@ -475,8 +477,10 @@ mod tests {
         // command is told up front that it must write LCOV itself.
         let (_, advisories) = CoverageSource::resolve(None, Some("my-tool --lcov"));
         assert_eq!(advisories.len(), 1, "{advisories:?}");
-        assert!(advisories[0].contains(LCOV_PLACEHOLDER), "{advisories:?}");
-        assert!(advisories[0].contains(DEFAULT_LCOV_PATH), "{advisories:?}");
+        assert_eq!(advisories[0].phase, Phase::Config);
+        let rendered = advisories[0].to_string();
+        assert!(rendered.contains(LCOV_PLACEHOLDER), "{rendered}");
+        assert!(rendered.contains(DEFAULT_LCOV_PATH), "{rendered}");
     }
 
     #[test]

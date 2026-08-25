@@ -678,18 +678,63 @@ alpha_one                      alpha                                  2    N/A  
 }
 
 #[test]
-fn one_lcov_record_claimed_by_two_members_is_a_collision_and_both_report_na() {
-    // Defect 3, the many-to-one case: the profile holds a *single* record and
-    // both members' `src/lib.rs` resolve to it — alpha's exactly, beta's by
-    // suffix. Each resolution is on its own unambiguous, so nothing local can
-    // see the clash; only the whole join can. An LCOV path is relative to a
-    // build root we do not know, so the record may describe either file: it is
-    // attributed to neither, both report N/A (C13), and the warning names the
-    // contested key and both claimants. Still not an error (C6).
+fn a_contested_record_goes_to_its_single_exact_claimant() {
+    // C19: the profile holds a *single* record and both members' `src/lib.rs`
+    // resolve to it — alpha's exactly, beta's by suffix. Those claims are not
+    // equal evidence: the record's key *is* alpha's path, while beta merely
+    // shares a suffix with it. So alpha is scored and beta is superseded —
+    // still diagnosed, still N/A (C13), and told where the record went. Before
+    // C19 the join discarded `Resolution` at exactly the moment it mattered and
+    // both reported N/A. Still not an error (C6).
     let dir = workspace_fixture("workspace_many_to_one");
     fs::write(
         dir.join("coverage.lcov"),
         "SF:src/lib.rs\nDA:2,1\nend_of_record\n",
+    )
+    .expect("write single-record lcov");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        "\
+CRAP Report
+===========
+Function                       Module                                CC    Cov%     CRAP
+----------------------------------------------------------------------------------------
+alpha_one                      alpha                                  2  100.0%      2.0
+beta_one                       beta                                   1    N/A       N/A
+"
+    );
+
+    let stderr = stderr_of(&out);
+    let lines: Vec<&str> = stderr.lines().collect();
+    // Only the loser is diagnosed: the winner's attribution is exact, and an
+    // exact match has always been silent.
+    assert_eq!(lines.len(), 1, "stderr: {stderr}");
+    assert!(
+        lines[0].contains(
+            "crates/beta/src/lib.rs: LCOV entry src/lib.rs matches src/lib.rs exactly, \
+             so it is attributed there"
+        ),
+        "stderr: {stderr}"
+    );
+    assert!(lines[0].contains("N/A"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_record_no_claimant_matches_exactly_is_a_collision_and_both_report_na() {
+    // The other C19 shape, and the original defect-3 case: the single record's
+    // key is a suffix of *both* members' paths and equal to neither, so nothing
+    // ranks the claims. An LCOV path is relative to a build root we do not
+    // know, so the record may describe either file: it is attributed to
+    // neither, both report N/A (C13), and each warning names the contested key
+    // and both claimants. Still not an error (C6).
+    let dir = workspace_fixture("workspace_unranked_claims");
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:lib.rs\nDA:2,1\nend_of_record\n",
     )
     .expect("write single-record lcov");
 
@@ -718,7 +763,7 @@ beta_one                       beta                                   1    N/A  
         // many-to-one mapping is what has to be fixed, and neither line stands
         // alone without it.
         assert!(
-            line.contains("LCOV entry src/lib.rs is claimed by src/lib.rs, crates/beta/src/lib.rs"),
+            line.contains("LCOV entry lib.rs is claimed by src/lib.rs, crates/beta/src/lib.rs"),
             "stderr: {stderr}"
         );
         assert!(line.contains("N/A"), "stderr: {stderr}");
@@ -963,6 +1008,142 @@ fn a_declared_module_with_no_file_warns_and_still_exits_zero() {
     assert!(lines[0].contains("demo::absent"), "stderr: {stderr}");
     assert!(lines[0].contains("src/absent.rs"), "stderr: {stderr}");
     assert!(lines[0].contains("src/absent/mod.rs"), "stderr: {stderr}");
+}
+
+/// C18: when discovery declines work, the *artifact* says so.
+#[test]
+fn a_single_declined_module_is_counted_on_stdout() {
+    // `crap4rust . > report.txt` must not look complete when it is not: the
+    // reader of the file never sees stderr, so a report missing a module has to
+    // carry that fact itself. One module is "1 module", not "1 modules", and it
+    // is separated from the table by a blank line — it is not a row, and a
+    // row-shaped reader must not mistake it for data.
+    let dir = fixture("declined_one");
+    fs::write(
+        dir.join("src").join("lib.rs"),
+        format!("mod absent;\n\n{SOURCE}"),
+    )
+    .expect("write source declaring a missing module");
+    fs::write(
+        dir.join("coverage.lcov"),
+        LCOV.replace("DA:2,3", "DA:4,3").replace("DA:6,", "DA:8,"),
+    )
+    .expect("write shifted lcov");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.ends_with("\n\n1 module not analysed (see stderr)\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn several_declined_modules_are_counted_on_stdout() {
+    // The count is of declined *modules*, and it is plural when it should be.
+    // A conditionally-pathed module is declined too: which file rustc compiles
+    // depends on a cfg set we do not evaluate.
+    let dir = fixture("declined_several");
+    fs::write(
+        dir.join("src").join("lib.rs"),
+        format!(
+            "mod absent;\n\
+             #[cfg_attr(windows, path = \"win.rs\")]\nmod imp;\n\n{SOURCE}"
+        ),
+    )
+    .expect("write source declining two modules");
+    fs::write(dir.join("coverage.lcov"), "SF:src/lib.rs\nend_of_record\n")
+        .expect("write empty lcov");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.ends_with("\n\n2 modules not analysed (see stderr)\n"),
+        "{stdout}"
+    );
+    assert_eq!(stderr_of(&out).lines().count(), 2, "{}", stderr_of(&out));
+}
+
+#[test]
+fn a_complete_report_carries_no_notice() {
+    // The notice is emitted *only* when work was declined, so the happy-path
+    // bytes are untouched (C14).
+    let dir = fixture("declined_none");
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert!(
+        !stdout_of(&out).contains("not analysed"),
+        "{}",
+        stdout_of(&out)
+    );
+}
+
+/// C20: `module` is the function's full module path and `name` is its bare
+/// name — for inline `mod`s as well as file modules.
+#[test]
+fn an_inline_module_names_the_function_in_the_module_column() {
+    // Before C20 the two fields split at different points depending on how the
+    // module was declared: a file module put its segment in Module, an inline
+    // one glued it to Function (`inner::bar`), so neither field had a stable
+    // meaning. The segment now moves to the Module column for both.
+    let dir = fixture("inline_module");
+    fs::write(
+        dir.join("src").join("lib.rs"),
+        "mod inner {\n    pub fn bar() -> i32 {\n        1\n    }\n}\n",
+    )
+    .expect("write source with an inline module");
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:src/lib.rs\nDA:3,1\nend_of_record\n",
+    )
+    .expect("write lcov");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    let row = stdout
+        .lines()
+        .find(|line| line.starts_with("bar "))
+        .unwrap_or_else(|| panic!("no row for `bar`: {stdout}"));
+    assert!(row.contains("demo::inner"), "{row}");
+    assert!(!stdout.contains("inner::bar"), "{stdout}");
+}
+
+/// FC-T9d: diagnostics survive an `Err`.
+#[test]
+fn warnings_produced_before_a_failure_are_still_printed() {
+    // Two channels meant the run-phase one was thrown away whenever a later
+    // stage failed: this workspace has an unresolvable module *and* an
+    // unparseable file, and printed only the error — losing the warning that
+    // best explains the state the crate is in. One sink, drained on `Err` as
+    // well as `Ok`, fixes it.
+    let dir = fixture("warnings_before_failure");
+    fs::write(dir.join("src").join("lib.rs"), "mod absent;\nmod broken;\n")
+        .expect("write source declaring a missing and a broken module");
+    fs::write(dir.join("src").join("broken.rs"), "fn broken( {\n")
+        .expect("write unparseable source");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    let lines: Vec<&str> = stderr.lines().collect();
+    // The warning first — it is a fact about the workspace that was true before
+    // the failure — then the error that ended the run.
+    assert!(lines[0].starts_with("warning: "), "stderr: {stderr}");
+    assert!(lines[0].contains("demo::absent"), "stderr: {stderr}");
+    assert!(
+        lines.iter().any(|line| line.starts_with("error: ")),
+        "stderr: {stderr}"
+    );
+    // Nothing is reported: the run did not complete.
+    assert_eq!(stdout_of(&out), "");
 }
 
 // ---------------------------------------------------------------------------

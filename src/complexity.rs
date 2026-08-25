@@ -18,11 +18,20 @@ use syn::visit::{self, Visit};
 /// Cyclomatic complexity plus source span for a single analysed function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FunctionComplexity {
-    /// Qualified display name assembled from enclosing context: module path for
-    /// free/nested `fn`s (`bar::foo`), `Type::method` for inherent impls,
-    /// `<Type as Trait>::method` for trait impls, and `Trait::method` for
-    /// provided trait methods. Cross-crate qualification is task T9.
+    /// The function's own name, qualified only by its receiver: `foo` for a
+    /// free or nested `fn`, `Type::method` for an inherent impl,
+    /// `<Type as Trait>::method` for a trait impl, and `Trait::method` for a
+    /// provided trait method (C4).
+    ///
+    /// **Enclosing `mod` blocks are not part of it** (C20): they belong to the
+    /// module path, and are carried separately in
+    /// [`module_path`](Self::module_path) so that a file module and an inline
+    /// module split the two fields at the same point (FC-T9a).
     pub(crate) name: String,
+    /// The inline `mod` segments enclosing this function, outermost first —
+    /// empty for a function at file scope. The file's own module path is
+    /// prepended downstream, where crate identity exists (C3).
+    pub(crate) module_path: Vec<String>,
     /// Cyclomatic complexity: base 1 plus one per decision point.
     pub(crate) complexity: u32,
     /// 1-based start line of the function in source.
@@ -33,6 +42,13 @@ pub(crate) struct FunctionComplexity {
 
 /// Parse `src` as a Rust source file and compute the cyclomatic complexity of
 /// every function it defines.
+///
+/// Test-only: the wired pipeline parses each file exactly **once**, in the
+/// discovery walk, and measures the AST it already holds via [`analyze_file`]
+/// (FC-T9h). Keeping this compiled out of production builds is what makes
+/// "one parse per file" a structural property rather than a convention — there
+/// is no second parse site to drift back into.
+#[cfg(test)]
 pub(crate) fn analyze_str(src: &str) -> syn::Result<Vec<FunctionComplexity>> {
     Ok(analyze_file(&syn::parse_file(src)?))
 }
@@ -79,6 +95,7 @@ impl FnCollector {
     fn record(&mut self, name: String, block: &syn::Block, span: proc_macro2::Span) {
         self.results.push(FunctionComplexity {
             name,
+            module_path: self.module_segments(),
             complexity: complexity_of_block(block),
             start_line: span.start().line,
             end_line: span.end().line,
@@ -113,17 +130,15 @@ impl FnCollector {
         }
     }
 
-    /// Qualified name for a free/nested `fn`: module path plus its own name.
-    fn free_name(&self, ident: &syn::Ident) -> String {
-        let mut segs = self.module_segments();
-        segs.push(ident.to_string());
-        segs.join("::")
+    /// Name for a free/nested `fn`: its own name. Enclosing `mod` segments are
+    /// the module path, not the name (C20).
+    fn free_name(ident: &syn::Ident) -> String {
+        ident.to_string()
     }
 
-    /// Qualified name for an impl/trait method: module path, receiver, own name.
+    /// Name for an impl/trait method: its receiver and its own name (C4).
     fn method_name(&self, ident: &syn::Ident) -> String {
-        let mut segs = self.module_segments();
-        segs.extend(self.method_receiver());
+        let mut segs: Vec<String> = self.method_receiver().into_iter().collect();
         segs.push(ident.to_string());
         segs.join("::")
     }
@@ -173,7 +188,7 @@ impl<'ast> Visit<'ast> for FnCollector {
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        let name = self.free_name(&node.sig.ident);
+        let name = Self::free_name(&node.sig.ident);
         self.record(name, &node.block, node.span());
         visit::visit_item_fn(self, node);
     }
@@ -577,54 +592,71 @@ mod tests {
     fn qualified_names_track_enclosing_context() {
         struct Case {
             src: &'static str,
-            expected: &'static str,
+            /// C20: the bare (or receiver-qualified) function name…
+            name: &'static str,
+            /// …and the inline `mod` segments enclosing it, which are the
+            /// module path and never part of the name.
+            module_path: &'static [&'static str],
         }
 
         let cases = [
-            // Free fn at crate root → bare name.
+            // Free fn at crate root → bare name, no module segments.
             Case {
                 src: "fn foo() {}",
-                expected: "foo",
+                name: "foo",
+                module_path: &[],
             },
-            // Free fn inside a nested module → module-path qualified.
+            // Free fn inside a nested module → the segment moves to the module
+            // path; the name stays bare (C20).
             Case {
                 src: "mod bar { fn foo() {} }",
-                expected: "bar::foo",
+                name: "foo",
+                module_path: &["bar"],
             },
             // Inherent impl method → Type::method.
             Case {
                 src: "struct Foo; impl Foo { fn bar(&self) {} }",
-                expected: "Foo::bar",
+                name: "Foo::bar",
+                module_path: &[],
             },
             // Trait-impl method → <Type as Trait>::method.
             Case {
                 src: "struct Foo; trait Tr { fn bar(&self); } impl Tr for Foo { fn bar(&self) {} }",
-                expected: "<Foo as Tr>::bar",
+                name: "<Foo as Tr>::bar",
+                module_path: &[],
             },
             // Provided (default-bodied) trait method → Trait::method.
             Case {
                 src: "trait T { fn m(&self) {} }",
-                expected: "T::m",
+                name: "T::m",
+                module_path: &[],
             },
-            // Module + impl combine → m::Type::method.
+            // Module + impl: the receiver stays in the name, the module in the
+            // module path.
             Case {
                 src: "mod m { struct Foo; impl Foo { fn bar(&self) {} } }",
-                expected: "m::Foo::bar",
+                name: "Foo::bar",
+                module_path: &["m"],
             },
             // Generics on the self-type are stripped for a clean name.
             Case {
                 src: "struct Foo<T>(T); impl<T> Foo<T> { fn bar(&self) {} }",
-                expected: "Foo::bar",
+                name: "Foo::bar",
+                module_path: &[],
             },
         ];
 
         for case in cases {
             let fns = analyze_str(case.src).expect("source should parse");
             assert!(
-                fns.iter().any(|f| f.name == case.expected),
-                "expected name {:?} among {:?}",
-                case.expected,
-                fns.iter().map(|f| f.name.as_str()).collect::<Vec<_>>()
+                fns.iter()
+                    .any(|f| f.name == case.name && f.module_path == case.module_path),
+                "expected {:?} in module {:?} among {:?}",
+                case.name,
+                case.module_path,
+                fns.iter()
+                    .map(|f| (f.name.as_str(), f.module_path.clone()))
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -636,12 +668,15 @@ mod tests {
         assert!(fns.iter().any(|f| f.name == "outer"));
         assert!(fns.iter().any(|f| f.name == "inner"));
 
-        // Inside a module: module-qualified, parent fn name still excluded.
+        // Inside a module: the module is the *module path*, the parent fn name
+        // is still excluded, and neither appears in the name (C20).
         let fns = analyze_str("mod m { fn outer() { fn inner() {} } }").expect("parses");
-        assert!(fns.iter().any(|f| f.name == "m::outer"));
-        assert!(fns.iter().any(|f| f.name == "m::inner"));
+        for name in ["outer", "inner"] {
+            let f = fns.iter().find(|f| f.name == name).expect(name);
+            assert_eq!(f.module_path, vec!["m".to_string()]);
+        }
 
-        // Inside an impl method: qualified by module path only, not the impl type.
+        // Inside an impl method: qualified by its receiver only.
         let fns = analyze_str("struct Foo; impl Foo { fn bar(&self) { fn inner() {} } }")
             .expect("parses");
         assert!(fns.iter().any(|f| f.name == "Foo::bar"));
@@ -653,9 +688,16 @@ mod tests {
         // Guards the push/visit/pop invariant: after visiting one frame, its
         // segment must be popped before the sibling is visited — no leakage.
         let fns = analyze_str("mod a { fn f() {} } mod b { fn f() {} }").expect("parses");
-        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
-        assert!(names.contains(&"a::f"), "expected a::f among {names:?}");
-        assert!(names.contains(&"b::f"), "expected b::f among {names:?}");
+        let modules: Vec<Vec<String>> = fns
+            .iter()
+            .filter(|f| f.name == "f")
+            .map(|f| f.module_path.clone())
+            .collect();
+        assert_eq!(
+            modules,
+            vec![vec!["a".to_string()], vec!["b".to_string()]],
+            "{modules:?}"
+        );
 
         let fns =
             analyze_str("struct A; struct B; impl A { fn m(&self) {} } impl B { fn m(&self) {} }")
@@ -669,11 +711,8 @@ mod tests {
     fn multi_level_module_nesting_accumulates_all_segments() {
         // Pins multi-frame accumulation and pop ordering across nested modules.
         let fns = analyze_str("mod a { mod b { fn f() {} } }").expect("parses");
-        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
-        assert!(
-            names.contains(&"a::b::f"),
-            "expected a::b::f among {names:?}"
-        );
+        let f = fns.iter().find(|f| f.name == "f").expect("f");
+        assert_eq!(f.module_path, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]

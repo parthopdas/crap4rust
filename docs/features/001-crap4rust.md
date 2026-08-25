@@ -82,7 +82,8 @@ One or more tasks per slice.
 | T7  | S1 | **CLI skeleton** — arg parse, wire pipeline, `--lcov-path`. Also lands C15 (identity fields). | **Done** | vibe/001 |
 | T8  | S2 | **Coverage runner** — invoke `cargo llvm-cov` → default `target/crap4rust/coverage.lcov`; `--test-command` override; zero-config default (C2). Makes `--lcov-path` optional — `missing_required_lcov_arg_exits_one` legitimately changes (expected evolution, not a regression). | **Done** | vibe/001 |
 | T9  | S3 | **Workspace enumeration** — cargo metadata; per-member modules, crate-qualified (C3). Checklist: replace `report::rows_from_joined` module derivation (FC-T6a); move source discovery out of `cli.rs` into its adapter; FC-T5a longest-overlap + `Ambiguous` resolution; FC-T5e `SourceUnit` refactor. | **Done** | vibe/001 |
-| T10 | S3 | **Product/test filtering** — exclude `#[cfg(test)]`/`#[test]`; `tests/`/`benches/`/`examples/` non-product; positional path-fragment filters (C5). | Pending | - |
+| T9b | S3 | **Diagnostic unification + single-parse streaming** (human-inserted, 2026-08-24). Discharges FC-T9d (one `Diagnostic{code,severity,phase,site,kind}`, one sink drained on `Err` **and** `Ok`), FC-T9h (discovery streams each parsed AST; one parse per file) and FC-T9k (`workspace/` split). Also lands C18 (incomplete-report notice), C19 (exact-wins collisions), C20 (module/name normalisation). | **Done** | vibe/001 |
+| T10 | S3 | **Product/test filtering** — exclude `#[cfg(test)]`/`#[test]`; `tests/`/`benches/`/`examples/` non-product; positional path-fragment filters (C5). Also FC-T9g (drop empty units before the join), FC-T9e (query key ≠ display path), FC-T9j (PATH is a locator; filters get their own surface). | Pending | - |
 | T11 | S4 | **JSON reporter** — versioned schema (`schema_version`), stable field contract. | Pending | - |
 | T12 | S5 | **Parallelism** — `rayon` across members/files; `-j/--jobs`, full CPUs default (C7). | Pending | - |
 | T13 | S5 | **Docs & limits** — async/macro CC caveats (C12), README, `--help`. Must document: FC-T8f "no spaces in `--test-command`" (workaround `--lcov-path`); the C17 crap4go `--test-command` divergences + `{lcov}` vs `{coverprofile}` migration note; FC-T5c (`total==0` renders `100.0%`); C15 duplicate-display-name rows. | Pending | - |
@@ -297,6 +298,103 @@ Forward constraints:
   from S1's directory walk — a user may notice a file "disappear"); declined conditionally-pathed
   subtrees are unmeasured; `PATH` is a locator, not a scope; **the report may be silently incomplete
   without reading stderr**; out-of-root members report `..` paths and today N/A coverage.
+
+### C18–C21 — Human rulings on T9 (2026-08-24)
+
+- **C18 — incomplete-report notice (resolves Anders §2).** When discovery declines any work, a single
+  trailing stdout line is emitted after the table: `N modules not analysed (see stderr)`. Rationale:
+  stderr is the wrong channel for a fact about the artifact when the artifact is the deliverable —
+  `crap4rust . > report.txt` must not look complete when it is not. **A report that can be silently
+  incomplete is a correctness property, not a formatting preference.** Additive: emitted only in the
+  declined case, so the happy-path bytes are untouched and the nine byte-locked C14 tests stand. C14
+  parity binds the **table**, not what follows it.
+- **C19 — exact-wins collision ranking (resolves FC-T9f).** When a contested LCOV key has **exactly
+  one** `Exact` claimant, that claimant wins and the `Suffix` claimants become `Unresolved` (each
+  still diagnosed). Any other shape (0 exact, or 2+ exact) stays `Collision` ⇒ N/A with all claimants
+  named. This is not a guess: an exact normalized match beating a suffix guess is **evidence**, and
+  `Resolution` exists precisely to carry *how* a file matched. Strictly reduces spurious N/A.
+- **C20 — module/name normalisation (resolves FC-T9a, option ii).** `module` is the function's **full**
+  module path (file scope **+** inline `mod` segments); `name` is the bare (or `<Type as Trait>::`
+  qualified) function name. Consequence: the C14 Function column changes for inline-mod functions
+  (`inner::bar` → `bar`) and the Module column absorbs the segment. **Accepted** — crap4go has no
+  nested modules, so parity does not bind here. The byte-locked C14 tests covering inline-mod cases
+  are updated **once**, deliberately, as part of T9b; the format itself stays frozen.
+- **C21 — T9b is inserted before T10 (resolves Anders §4).** FC-T9d and FC-T9h land **now**, not folded
+  into later tasks. FC-T9d is a live bug (discovery diagnostics are lost whenever a later stage
+  fails), and FC-T9h defines T12's unit of work — deferring it means writing the parallel structure
+  twice. Both are behaviour-preserving apart from the bug fix.
+
+### T9b review notes (Bhaskar PASS first round; Anders — approve-with-suggestions, 2026-08-24)
+
+Anders: *"the best-shaped commit on the branch."* The lost-warnings bug is fixed structurally, not
+patched, and FC-T9h landed in its strongest form — `complexity::analyze_str` is `#[cfg(test)]`-only,
+so **single-parse is a property, not a convention**. `Diagnostic::new` as the sole construction path
+means `code`/`severity` cannot disagree with `kind`; per-variant `code` hand-written in a `match`
+(not derived from variant names) correctly decouples the wire id from Rust identifiers.
+
+**`RunOutput` deleted — FC-T7b confirmed satisfied, in a stronger form.** The constraint's letter was
+"one field per output stream, nothing else"; its intent was that the deferred gate (D1) cannot smuggle
+counters or flags into the return type. `run(&RunConfig, &mut Vec<Diagnostic>) -> Result<String>`
+satisfies it maximally: **there is no struct left to grow a third field.**
+
+**`visited`/`seen` collapsed into one identity-keyed set** with the skip happening *before* parsing.
+"One file is measured, named and diagnosed exactly once" now holds at a single choke point
+(`visited.insert`) rather than across two collections plus `FileEntry.diagnostics` plumbing — and the
+`#[path]` hang is guarded by the same line. Fewer invariants, one enforcement site.
+
+**Enumeration order is now module-graph BFS**, not path-sorted — forced by streaming (you cannot sort
+a stream without buffering, and buffering is what FC-T9h forbids). Anders: BFS is also the *truthful*
+order, since we model rustc's module graph and graph order is the order the modelled thing has;
+path-sorted order was an artifact of the directory walk we deleted. Determinism holds (Bhaskar
+verified no filesystem enumeration order participates).
+
+**C19 deviation accepted (driver ruling).** The human ruling said superseded claimants become
+`Unresolved`; Dave used a new `Attribution::Superseded{key, winner}` because `Unresolved` renders
+*"absent from the coverage profile"* — which would be **false**: the record exists and belongs to a
+named file. Observable outcome is identical (N/A + diagnosed); only the wording is honest. Endorsed.
+
+Forward constraints:
+- **FC-T9b\* (per-row coverage caveat — SUPERSEDES FC-T9b).** `JoinedFunction` must carry its file's
+  attribution before T11, and the caveat has **five** states, not three: `suffix` (scored, but
+  possibly the **wrong file's numbers** — arguably more dangerous than a null, and not covered by the
+  original FC-T9b), `absent`, `ambiguous`, `contested`, `superseded` (plus silent `exact`). Derive
+  from **one** function on `Attribution` consumed by both the stderr path and the JSON reporter; T11
+  must **not** re-join attributions to rows by path string.
+- **FC-T9m (diagnostic wire shape — before `schema_version`).** Rule at T11 whether `warnings[]`
+  entries are **flat** (`code`, `severity`, `phase`, `file`, `line`, `column`, `message`) with an
+  explicitly non-contractual `data` object, or a **variant-shaped union**. Flat recommended: a union
+  makes every future `Kind` variant a schema change. `code` strings are **append-only and never
+  renamed** once emitted — byte-lock all ten now (today `every_kind_has_a_distinct_code` asserts
+  *distinctness*, not values, so a variant rename plus a careless `code()` edit silently breaks every
+  consumer). Note the real freeze question is the **payload**, not the field list: `Kind` variants
+  carry structured particulars (`candidates`, `keys`, `claimants`, `winner`) that today exist only
+  inside `Display`.
+- **FC-T9n (the C18 notice is presentation).** `run` appends the notice to the rendered report. When
+  T11 selects the reporter **inside** `run` (FC-T7b), the notice must move behind that selection or it
+  **will be concatenated onto a JSON document**. JSON carries the declined count structurally
+  (FC-T9c), never as trailing text; both must come from the one `Kind::declines_analysis` predicate.
+- **FC-T9o (cross-referenced identities).** `Superseded.winner` names another row's `file`. It must be
+  the identical normalized identity rows carry, or a consumer cannot follow the reference. Binds
+  together with FC-T9e — a `..`-prefixed out-of-root member could appear as a `winner` matching no
+  row's `file`.
+- **FC-T9p (severity stays warning-only while C6 holds).** `severity` earns its place by reserving the
+  JSON slot so the shape cannot change later. **Do not add `Severity::Error`** while C6 holds: a
+  diagnostic that says "error" and exits 0 is worse than no severity field. An operational failure is
+  an `Err`, and that is its correct home.
+- **FC-T9g escalated.** Was "post-T10 stderr noise"; it is now a **stdout number**. A
+  `#[cfg(test)] mod tests;` whose file is absent will inflate "N modules not analysed" **on the
+  artifact itself**. Now the highest-value item in T10.
+- **FC-T9i extended.** Under streaming, T12 must parallelise measurement over a **bounded window** of
+  ASTs and must never buffer the workspace's ASTs to restore a sort order.
+- **FC-T9q (T11 sorts `functions[]` explicitly).** The JSON array must be sorted by C14's ordering
+  (FC-T6d) and must **not** inherit input order — otherwise BFS graph order silently becomes part of
+  the schema contract.
+- **FC-T9r (`#[allow(dead_code)]` register).** `Diagnostic::code` and `::phase` are dead until T11 —
+  correct over premature plumbing, but track them on the T11 checklist the way FC-T4a tracked `band`.
+- Deferred test debt (Anders, cheap): byte-lock all ten `code` strings; a file reachable from two
+  targets declaring a missing submodule ⇒ exactly **one** diagnostic and a C18 count of **1**
+  (converts the emergent dedup property back into a stated one and guards the C18 number);
+  `Superseded` end-to-end at integration level to pin ordering.
 
 ### C16 — Bidirectional path matching — **DELIBERATE DIVERGENCE (verified, 2026-08-24)**
 

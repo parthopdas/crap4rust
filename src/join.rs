@@ -41,8 +41,9 @@ use crate::crap;
 pub(crate) struct JoinedFunction {
     /// Qualified display name, carried straight from [`FunctionComplexity`].
     pub(crate) name: String,
-    /// Crate-qualified module path of the owning source unit (C3), carried
-    /// through for the reporter's Module column.
+    /// Full module path of the function (C3/C20): the source unit's
+    /// crate-qualified module path plus the inline `mod` segments enclosing the
+    /// function. Carried through for the reporter's Module column.
     pub(crate) module: String,
     /// Source file path (as given to the join). Carried through for the C15
     /// identity key; not normalized here.
@@ -99,26 +100,38 @@ pub(crate) struct SourceUnit {
 /// claims the same record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Attribution<'a> {
-    /// The file's own resolution stands: it is the only claimant of its key (or
-    /// it has no key at all — absent, or an ambiguous tie).
+    /// The file's own resolution stands: it is the only claimant of its key, or
+    /// the only one that matched it *exactly* (C19), or it has no key at all
+    /// (absent, or an ambiguous tie).
     Resolved(Resolution<'a>),
-    /// Several distinct source paths claim one LCOV record, so it is attributed
-    /// to none of them: their functions report `N/A` (C13).
+    /// Several distinct source paths claim one LCOV record and none of them
+    /// outranks the others, so it is attributed to none of them: their
+    /// functions report `N/A` (C13).
     Collision {
         /// The contested LCOV key.
         key: &'a str,
         /// Every source path claiming it, in join input order.
         sources: Vec<String>,
     },
+    /// This file claimed a record by suffix match and lost it to the single
+    /// claimant that matched it exactly (C19). Its functions report `N/A` — the
+    /// record is not its, and no other record is either.
+    Superseded {
+        /// The contested LCOV key.
+        key: &'a str,
+        /// The source path that matched `key` exactly and therefore owns it.
+        winner: String,
+    },
 }
 
 impl<'a> Attribution<'a> {
     /// The LCOV key this file's coverage may be read from; `None` whenever
-    /// there is no single defensible record — absent, ambiguous, or contested.
+    /// there is no single defensible record — absent, ambiguous, contested, or
+    /// lost to an exact claimant.
     fn key(&self) -> Option<&'a str> {
         match self {
             Self::Resolved(resolution) => resolution.key(),
-            Self::Collision { .. } => None,
+            Self::Collision { .. } | Self::Superseded { .. } => None,
         }
     }
 }
@@ -157,27 +170,33 @@ pub(crate) fn join<'a>(lcov: &'a LcovData, units: &[SourceUnit]) -> JoinResult<'
         .map(|unit| lcov.resolve_path(&unit.path))
         .collect();
 
-    // 2. Who claims which LCOV record. Distinct *paths* only: the same file
-    //    listed twice is one claimant, not a collision with itself.
-    let mut claims: BTreeMap<&'a str, Vec<String>> = BTreeMap::new();
+    // 2. Who claims which LCOV record, and how strongly. Distinct *paths*
+    //    only: the same file listed twice is one claimant, not a collision with
+    //    itself. `Resolution` already records *how* a file matched, and C19 is
+    //    exactly the moment that stops being decoration: an exact claim is
+    //    evidence a suffix claim does not have.
+    let mut claims: BTreeMap<&'a str, Vec<Claim>> = BTreeMap::new();
     for (unit, resolution) in units.iter().zip(&resolved) {
         if let Some(key) = resolution.key() {
             let claimants = claims.entry(key).or_default();
-            if !claimants.contains(&unit.path) {
-                claimants.push(unit.path.clone());
+            if !claimants.iter().any(|claim| claim.path == unit.path) {
+                claimants.push(Claim {
+                    path: unit.path.clone(),
+                    exact: matches!(resolution, Resolution::Exact(_)),
+                });
             }
         }
     }
 
-    // 3. Score, skipping every file whose record is claimed by someone else too.
+    // 3. Score, skipping every file whose record another file has a better — or
+    //    an equally good — claim on.
     let mut functions = Vec::new();
     let mut attributions = Vec::new();
     for (unit, resolution) in units.iter().zip(resolved) {
         let attribution = match resolution.key().map(|key| (key, &claims[key])) {
-            Some((key, claimants)) if claimants.len() > 1 => Attribution::Collision {
-                key,
-                sources: claimants.clone(),
-            },
+            Some((key, claimants)) if claimants.len() > 1 => {
+                contested(key, claimants, &unit.path, resolution)
+            }
             _ => Attribution::Resolved(resolution),
         };
         let key = attribution.key();
@@ -186,7 +205,7 @@ pub(crate) fn join<'a>(lcov: &'a LcovData, units: &[SourceUnit]) -> JoinResult<'
             let crap = crap::score(fc.complexity, coverage);
             functions.push(JoinedFunction {
                 name: fc.name.clone(),
-                module: unit.module.clone(),
+                module: module_of(unit, fc),
                 file: unit.path.clone(),
                 start_line: fc.start_line,
                 complexity: fc.complexity,
@@ -199,6 +218,60 @@ pub(crate) fn join<'a>(lcov: &'a LcovData, units: &[SourceUnit]) -> JoinResult<'
     JoinResult {
         functions,
         attributions,
+    }
+}
+
+/// One source file's claim on an LCOV record, with the evidence behind it.
+struct Claim {
+    path: String,
+    /// The claim came from an [`Resolution::Exact`] match — the record's own
+    /// key *is* this file's path, not merely a suffix of it.
+    exact: bool,
+}
+
+/// Settle a contested LCOV record between its claimants (C19).
+///
+/// With **exactly one** exact claimant, the evidence is not symmetric: that
+/// file's path *is* the record's key, while every other claimant only shares a
+/// path suffix with it. The exact claimant takes the record, and the losers are
+/// [`Superseded`](Attribution::Superseded) — reported, unscored (C13), and each
+/// told where its record went.
+///
+/// Any other shape — no exact claimant, or two of them — is a genuine
+/// [`Collision`](Attribution::Collision): nothing in the data ranks the claims,
+/// so the record is attributed to none of them and every claimant is named.
+fn contested<'a>(
+    key: &'a str,
+    claimants: &[Claim],
+    path: &str,
+    resolution: Resolution<'a>,
+) -> Attribution<'a> {
+    let mut exact = claimants.iter().filter(|claim| claim.exact);
+    match (exact.next(), exact.next()) {
+        (Some(winner), None) if winner.path == path => Attribution::Resolved(resolution),
+        (Some(winner), None) => Attribution::Superseded {
+            key,
+            winner: winner.path.clone(),
+        },
+        _ => Attribution::Collision {
+            key,
+            sources: claimants.iter().map(|claim| claim.path.clone()).collect(),
+        },
+    }
+}
+
+/// The function's full module path (C20): the file's crate-qualified module
+/// path, plus the inline `mod` segments enclosing the function.
+///
+/// Both halves are needed and neither knows the other: crate and file identity
+/// exist only in discovery, inline `mod` nesting only in the AST. Composing
+/// them here is what makes `module` mean "the module this function is in" for
+/// *every* function, rather than "as much of it as one side happened to see".
+fn module_of(unit: &SourceUnit, fc: &FunctionComplexity) -> String {
+    if fc.module_path.is_empty() {
+        unit.module.clone()
+    } else {
+        format!("{}::{}", unit.module, fc.module_path.join("::"))
     }
 }
 
@@ -252,6 +325,7 @@ end_of_record
     fn fc(name: &str, complexity: u32, start_line: usize, end_line: usize) -> FunctionComplexity {
         FunctionComplexity {
             name: name.to_string(),
+            module_path: Vec::new(),
             complexity,
             start_line,
             end_line,
@@ -346,16 +420,17 @@ end_of_record
     }
 
     /// Defect 3 (the many-to-one case `resolve_path` cannot see): a single LCOV
-    /// record and two members whose paths both resolve to it. Each query has
-    /// exactly one candidate, so neither is *ambiguous* — yet the record can
-    /// describe only one of them, and nothing says which. Both must be N/A.
+    /// record and two members whose paths both resolve to it *by suffix*. Each
+    /// query has exactly one candidate, so neither is *ambiguous* — yet the
+    /// record can describe only one of them, and nothing says which. Both must
+    /// be N/A.
     #[test]
     fn one_lcov_record_claimed_by_two_sources_is_a_collision_and_unscored() {
         let lcov = parse_lcov("SF:src/lib.rs\nDA:10,1\nend_of_record\n").expect("valid fixture");
         let units = vec![
             SourceUnit {
                 module: "alpha".to_string(),
-                path: "src/lib.rs".to_string(),
+                path: "crates/alpha/src/lib.rs".to_string(),
                 functions: vec![fc("alpha_one", 2, 10, 13)],
             },
             SourceUnit {
@@ -371,14 +446,14 @@ end_of_record
             assert_eq!(joined.crap, None, "{} was scored", joined.name);
         }
         let sources = vec![
-            "src/lib.rs".to_string(),
+            "crates/alpha/src/lib.rs".to_string(),
             "crates/beta/src/lib.rs".to_string(),
         ];
         assert_eq!(
             result.attributions,
             vec![
                 (
-                    "src/lib.rs".to_string(),
+                    "crates/alpha/src/lib.rs".to_string(),
                     Attribution::Collision {
                         key: "src/lib.rs",
                         sources: sources.clone(),
@@ -393,6 +468,122 @@ end_of_record
                 ),
             ]
         );
+    }
+
+    /// C19: the claims on a contested record are not always symmetric. One
+    /// claimant whose path *is* the record's key has evidence the other, which
+    /// merely shares a suffix with it, does not — so the exact claimant is
+    /// scored and the suffix claimant is superseded (still diagnosed, still
+    /// N/A). Before C19 both were N/A and a provable attribution was thrown
+    /// away.
+    #[test]
+    fn a_single_exact_claimant_wins_a_contested_record() {
+        let lcov = parse_lcov("SF:src/lib.rs\nDA:10,1\nend_of_record\n").expect("valid fixture");
+        let units = vec![
+            SourceUnit {
+                module: "alpha".to_string(),
+                path: "src/lib.rs".to_string(),
+                functions: vec![fc("alpha_one", 2, 10, 13)],
+            },
+            SourceUnit {
+                module: "beta".to_string(),
+                path: "crates/beta/src/lib.rs".to_string(),
+                functions: vec![fc("beta_one", 1, 10, 13)],
+            },
+        ];
+        let result = join(&lcov, &units);
+
+        assert_eq!(result.functions[0].coverage, Some(1.0));
+        assert_eq!(result.functions[1].coverage, None);
+        assert_eq!(result.functions[1].crap, None);
+        assert_eq!(
+            result.attributions,
+            vec![
+                (
+                    "src/lib.rs".to_string(),
+                    Attribution::Resolved(Resolution::Exact("src/lib.rs"))
+                ),
+                (
+                    "crates/beta/src/lib.rs".to_string(),
+                    Attribution::Superseded {
+                        key: "src/lib.rs",
+                        winner: "src/lib.rs".to_string(),
+                    }
+                ),
+            ]
+        );
+    }
+
+    /// The other side of C19: two exact claimants rank equally, so the record
+    /// is still attributed to neither. Reachable because normalization maps
+    /// distinct spellings onto one key — `./src/lib.rs` and `src/lib.rs` are
+    /// two source files as far as the join is concerned.
+    #[test]
+    fn two_exact_claimants_stay_a_collision() {
+        let lcov = parse_lcov("SF:src/lib.rs\nDA:10,1\nend_of_record\n").expect("valid fixture");
+        let units = vec![
+            SourceUnit {
+                module: "alpha".to_string(),
+                path: "src/lib.rs".to_string(),
+                functions: vec![fc("alpha_one", 2, 10, 13)],
+            },
+            SourceUnit {
+                module: "beta".to_string(),
+                path: "./src/lib.rs".to_string(),
+                functions: vec![fc("beta_one", 1, 10, 13)],
+            },
+        ];
+        let result = join(&lcov, &units);
+
+        for joined in &result.functions {
+            assert_eq!(joined.coverage, None, "{} was scored", joined.name);
+        }
+        let sources = vec!["src/lib.rs".to_string(), "./src/lib.rs".to_string()];
+        assert_eq!(
+            result.attributions,
+            vec![
+                (
+                    "src/lib.rs".to_string(),
+                    Attribution::Collision {
+                        key: "src/lib.rs",
+                        sources: sources.clone(),
+                    }
+                ),
+                (
+                    "./src/lib.rs".to_string(),
+                    Attribution::Collision {
+                        key: "src/lib.rs",
+                        sources,
+                    }
+                ),
+            ]
+        );
+    }
+
+    /// C20: `module` is the function's *full* module path, so an inline `mod`
+    /// segment belongs in it — not glued to the function's name. Neither half
+    /// can produce it alone: crate/file identity exists only upstream of the
+    /// join, inline nesting only in the AST.
+    #[test]
+    fn inline_module_segments_extend_the_module_path() {
+        let lcov = parse_lcov(FIXTURE).expect("valid fixture");
+        let units = vec![SourceUnit {
+            module: "demo::foo".to_string(),
+            path: "src/foo.rs".to_string(),
+            functions: vec![
+                fc("top", 1, 10, 13),
+                FunctionComplexity {
+                    module_path: vec!["inner".to_string(), "deeper".to_string()],
+                    ..fc("bar", 1, 10, 13)
+                },
+            ],
+        }];
+        let joined = join(&lcov, &units).functions;
+
+        assert_eq!(joined[0].module, "demo::foo");
+        assert_eq!(joined[0].name, "top");
+        assert_eq!(joined[1].module, "demo::foo::inner::deeper");
+        assert_eq!(joined[1].name, "bar");
     }
 
     /// The other half of defect 3: an uncontested record is still scored — the

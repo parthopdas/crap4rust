@@ -9,6 +9,7 @@ pub mod cli;
 mod complexity;
 mod coverage;
 mod crap;
+mod diagnostic;
 mod join;
 mod report;
 mod runner;
