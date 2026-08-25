@@ -1,8 +1,9 @@
 //! CLI edge (T7) — argument parsing and pipeline composition.
 //!
-//! This is the only place that knows about the filesystem layout of a run: it
-//! discovers Rust sources, loads the LCOV profile, and drives the pure core
-//! (CC engine → join → reporter). Everything it calls inward is pure.
+//! This is the composition root: it asks the coverage adapter for an LCOV file
+//! and the discovery adapter for the workspace's sources, reads and analyses
+//! each source, and drives the pure core (CC engine → join → reporter).
+//! Everything it calls inward is pure.
 //!
 //! **Process concerns stay in `main.rs`.** [`run`] is fallible and *returns*
 //! the rendered report plus any resolution diagnostics instead of printing
@@ -10,23 +11,27 @@
 //! output; `main` maps `Err` to stderr + exit code 1, writes diagnostics to
 //! stderr, and prints the report to stdout (C6).
 //!
-//! **S2 surface.** Coverage is zero-config (C2): without `--lcov-path` the
+//! **S2/S3 surface.** Coverage is zero-config (C2): without `--lcov-path` the
 //! coverage command runs first and the LCOV artifact *it* produced is read
 //! back. Which of the two it is, and the whole artifact lifecycle around a
-//! generated one, is the runner adapter's policy ([`crate::runner`]) — this
-//! module only asks it for a path to read. Source discovery is still a
-//! deliberately minimal `.rs` walk because workspace enumeration is T9 and
-//! product/test filtering is T10. There is no `--threshold`: v1 is a reporter,
-//! not a gate (C6/C11/D1).
+//! generated one, is the runner adapter's policy ([`crate::runner`]). Source
+//! discovery is likewise the discovery adapter's policy
+//! ([`crate::workspace`]) — workspace members, crate-qualified module names and
+//! the path each file is known by all come from there (FC-T7d). Coverage is
+//! generated **once per invocation** and discovery runs per member: `cargo
+//! llvm-cov` is workspace-aware, so there is exactly one artifact and no root
+//! can clobber another's (FC-T8e). Product-vs-test filtering is still T10.
+//! There is no `--threshold`: v1 is a reporter, not a gate (C6/C11/D1).
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use clap::Parser;
 
+use crate::join::SourceUnit;
 use crate::runner::CoverageSource;
-use crate::{complexity, coverage, join, report};
+use crate::{complexity, coverage, join, report, workspace};
 
 /// `crap4rust [--lcov-path <PATH>] [--test-command <COMMAND>] <PATH>`.
 #[derive(Parser)]
@@ -54,7 +59,11 @@ pub struct Cli {
     #[arg(long, value_name = "COMMAND")]
     test_command: Option<String>,
 
-    /// Rust source file, or directory to scan recursively for `.rs` files.
+    /// A path inside the cargo workspace to analyse.
+    ///
+    /// Only used to find the workspace: cargo searches this path and its
+    /// ancestors for the manifest, and every member of the workspace it finds
+    /// is analysed (C3/A3).
     #[arg(value_name = "PATH")]
     path: PathBuf,
 }
@@ -68,7 +77,7 @@ pub struct RunConfig {
     /// ignored `--test-command`). Advisory only: they never affect the exit
     /// code (C6).
     advisories: Vec<String>,
-    /// Rust source file or directory to analyse.
+    /// A path inside the cargo workspace to analyse.
     path: PathBuf,
 }
 
@@ -124,9 +133,10 @@ pub struct RunOutput {
 ///
 /// Every failure here is an *operational* error (C6 ⇒ exit 1): a coverage
 /// command that cannot be run or exits non-zero, unreadable or unparseable
-/// LCOV, a missing path, or a source file that does not parse. High-CRAP
-/// functions are **not** an error — they are simply reported, and neither is a
-/// fuzzy or missing coverage match: those are diagnosed, not failed.
+/// LCOV, a path that is not in a cargo workspace, or a source file that does
+/// not parse. High-CRAP functions are **not** an error — they are simply
+/// reported, and neither is a fuzzy, ambiguous or missing coverage match: those
+/// are diagnosed, not failed.
 pub fn run(config: &RunConfig) -> anyhow::Result<RunOutput> {
     let lcov_path = config.coverage.ensure_lcov()?;
 
@@ -134,74 +144,62 @@ pub fn run(config: &RunConfig) -> anyhow::Result<RunOutput> {
         .with_context(|| format!("failed to load LCOV file {}", lcov_path.display()))?;
 
     let mut units = Vec::new();
-    for file in discover_sources(&config.path)? {
-        let src = fs::read_to_string(&file)
-            .with_context(|| format!("failed to read source file {}", file.display()))?;
-        let fns = complexity::analyze_str(&src)
-            .with_context(|| format!("failed to parse Rust source {}", file.display()))?;
-        units.push((file.display().to_string(), fns));
+    let discovery = workspace::discover(&config.path)?;
+    for source in discovery.sources {
+        let src = fs::read_to_string(&source.absolute)
+            .with_context(|| format!("failed to read source file {}", source.absolute.display()))?;
+        let functions = complexity::analyze_str(&src).with_context(|| {
+            format!("failed to parse Rust source {}", source.absolute.display())
+        })?;
+        units.push(SourceUnit {
+            module: source.module,
+            path: source.path,
+            functions,
+        });
     }
 
     let joined = join::join(&lcov, &units);
+    // Discovery diagnostics come first: a declared module the graph could not
+    // reach explains why a file is missing from everything that follows.
+    let mut diagnostics = discovery.diagnostics;
+    diagnostics.extend(attribution_diagnostics(&joined.attributions));
     Ok(RunOutput {
         report: report::format_report(&report::rows_from_joined(&joined.functions)),
-        diagnostics: resolution_diagnostics(&joined.resolutions),
+        diagnostics,
     })
 }
 
-/// Render the join's per-file resolution statuses (FC-T5b) as stderr lines.
+/// Render the join's per-file attributions (FC-T5b) as stderr lines.
 ///
 /// Exact matches are silent. A non-exact (suffix) match names the LCOV key it
 /// landed on, because the numbers reported for that file are only as
-/// trustworthy as that guess; an unresolved file says so plainly, because its
-/// functions report `N/A` (C13).
-fn resolution_diagnostics(resolutions: &[(String, coverage::Resolution<'_>)]) -> Vec<String> {
-    resolutions
+/// trustworthy as that guess; an ambiguous match names *every* key it was torn
+/// between, because that set is what the user has to disambiguate; a collision
+/// names the contested key *and* every source file claiming it, because the
+/// mapping — not the file — is what has to be fixed; an unresolved file says so
+/// plainly. All but the first two report `N/A` for their functions (C13).
+fn attribution_diagnostics(attributions: &[(String, join::Attribution<'_>)]) -> Vec<String> {
+    attributions
         .iter()
-        .filter_map(|(file, resolution)| match resolution {
-            coverage::Resolution::Exact(_) => None,
-            coverage::Resolution::Suffix(key) => Some(format!(
+        .filter_map(|(file, attribution)| match attribution {
+            join::Attribution::Resolved(coverage::Resolution::Exact(_)) => None,
+            join::Attribution::Resolved(coverage::Resolution::Suffix(key)) => Some(format!(
                 "warning: {file}: no exact coverage entry; resolved by suffix match to LCOV entry {key}"
             )),
-            coverage::Resolution::Unresolved => Some(format!(
+            join::Attribution::Resolved(coverage::Resolution::Ambiguous(keys)) => Some(format!(
+                "warning: {file}: coverage entry is ambiguous between {}; its functions report N/A",
+                keys.join(", ")
+            )),
+            join::Attribution::Resolved(coverage::Resolution::Unresolved) => Some(format!(
                 "warning: {file}: absent from the coverage profile; its functions report N/A"
+            )),
+            join::Attribution::Collision { key, sources } => Some(format!(
+                "warning: {file}: LCOV entry {key} is claimed by {}; \
+                 which file it covers cannot be proven, so their functions report N/A",
+                sources.join(", ")
             )),
         })
         .collect()
-}
-
-/// Collect the Rust sources to analyse under `root`.
-///
-/// A file path is taken as-is; a directory is walked recursively for `.rs`
-/// files. Results are sorted so a run is deterministic regardless of directory
-/// iteration order. Product-vs-test filtering is T10 and workspace member
-/// enumeration is T9 — neither is pre-built here.
-fn discover_sources(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    if root.is_file() {
-        return Ok(vec![root.to_path_buf()]);
-    }
-    if !root.is_dir() {
-        bail!("path not found: {}", root.display());
-    }
-
-    let mut found = Vec::new();
-    let mut dirs = vec![root.to_path_buf()];
-    while let Some(dir) = dirs.pop() {
-        let entries = fs::read_dir(&dir)
-            .with_context(|| format!("failed to read directory {}", dir.display()))?;
-        for entry in entries {
-            let path = entry
-                .with_context(|| format!("failed to read directory {}", dir.display()))?
-                .path();
-            if path.is_dir() {
-                dirs.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                found.push(path);
-            }
-        }
-    }
-    found.sort();
-    Ok(found)
 }
 
 #[cfg(test)]
@@ -230,53 +228,31 @@ mod tests {
     }
 
     #[test]
-    fn missing_path_is_an_error() {
-        let err = discover_sources(Path::new("no/such/directory")).unwrap_err();
-        assert!(err.to_string().contains("path not found"));
-    }
-
-    #[test]
-    fn a_file_path_is_taken_as_is() {
-        let this_file = Path::new(file!());
-        assert_eq!(
-            discover_sources(this_file).unwrap(),
-            vec![this_file.to_path_buf()]
-        );
-    }
-
-    #[test]
-    fn a_directory_is_walked_for_rs_files_in_sorted_order() {
-        let found = discover_sources(Path::new("src")).unwrap();
-        assert!(found
-            .iter()
-            .all(|p| p.extension().is_some_and(|e| e == "rs")));
-        assert!(found.contains(&PathBuf::from("src").join("cli.rs")));
-        let mut sorted = found.clone();
-        sorted.sort();
-        assert_eq!(found, sorted);
-    }
-
-    #[test]
     fn exact_resolutions_produce_no_diagnostics() {
-        let diags = resolution_diagnostics(&[(
+        let diags = attribution_diagnostics(&[(
             "src/lib.rs".to_string(),
-            coverage::Resolution::Exact("src/lib.rs"),
+            join::Attribution::Resolved(coverage::Resolution::Exact("src/lib.rs")),
         )]);
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn suffix_and_unresolved_resolutions_produce_one_diagnostic_each() {
-        let diags = resolution_diagnostics(&[
+        let diags = attribution_diagnostics(&[
             (
                 "src/lib.rs".to_string(),
-                coverage::Resolution::Exact("src/lib.rs"),
+                join::Attribution::Resolved(coverage::Resolution::Exact("src/lib.rs")),
             ),
             (
                 "src/fuzzy.rs".to_string(),
-                coverage::Resolution::Suffix("crates/demo/src/fuzzy.rs"),
+                join::Attribution::Resolved(coverage::Resolution::Suffix(
+                    "crates/demo/src/fuzzy.rs",
+                )),
             ),
-            ("src/gone.rs".to_string(), coverage::Resolution::Unresolved),
+            (
+                "src/gone.rs".to_string(),
+                join::Attribution::Resolved(coverage::Resolution::Unresolved),
+            ),
         ]);
 
         assert_eq!(diags.len(), 2, "{diags:?}");
@@ -288,5 +264,65 @@ mod tests {
         );
         assert!(diags[1].contains("src/gone.rs"), "{}", diags[1]);
         assert!(diags[1].contains("N/A"), "{}", diags[1]);
+    }
+
+    /// FC-T5a: a tie must be *actionable* — "ambiguous, good luck" is worse
+    /// than no warning, so the diagnostic names every tied candidate.
+    #[test]
+    fn an_ambiguous_resolution_names_the_tied_candidates() {
+        let diags = attribution_diagnostics(&[(
+            "src/lib.rs".to_string(),
+            join::Attribution::Resolved(coverage::Resolution::Ambiguous(vec![
+                "crates/alpha/src/lib.rs",
+                "crates/beta/src/lib.rs",
+            ])),
+        )]);
+
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].contains("ambiguous"), "{}", diags[0]);
+        assert!(diags[0].contains("crates/alpha/src/lib.rs"), "{}", diags[0]);
+        assert!(diags[0].contains("crates/beta/src/lib.rs"), "{}", diags[0]);
+        assert!(diags[0].contains("N/A"), "{}", diags[0]);
+    }
+
+    /// Defect 3: a contested LCOV record must name the record *and* every
+    /// source file claiming it — the many-to-one mapping is what has to be
+    /// fixed, and neither claimant can be identified from its own line alone.
+    #[test]
+    fn a_collision_names_the_contested_key_and_every_claimant() {
+        let sources = vec![
+            "src/lib.rs".to_string(),
+            "crates/beta/src/lib.rs".to_string(),
+        ];
+        let diags = attribution_diagnostics(&[
+            (
+                "src/lib.rs".to_string(),
+                join::Attribution::Collision {
+                    key: "src/lib.rs",
+                    sources: sources.clone(),
+                },
+            ),
+            (
+                "crates/beta/src/lib.rs".to_string(),
+                join::Attribution::Collision {
+                    key: "src/lib.rs",
+                    sources,
+                },
+            ),
+        ]);
+
+        assert_eq!(diags.len(), 2, "{diags:?}");
+        for diag in &diags {
+            // The claimant list is asserted whole: checking for `src/lib.rs`
+            // alone would be satisfied by the contested LCOV key of the same
+            // name, so neither claimant would actually be required.
+            assert!(
+                diag.contains(
+                    "LCOV entry src/lib.rs is claimed by src/lib.rs, crates/beta/src/lib.rs"
+                ),
+                "{diag}"
+            );
+            assert!(diag.contains("N/A"), "{diag}");
+        }
     }
 }

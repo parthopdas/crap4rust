@@ -7,14 +7,12 @@
 //! without capturing process output.
 //!
 //! **Why a separate [`ReportRow`] instead of formatting [`JoinedFunction`]
-//! directly.** C14's second column is *Module*, but the join only carries a
-//! source `file` path — crate-qualified module naming is C3/S3 (T9), not this
-//! task. So the reporter is deliberately *told* the module string rather than
-//! deriving crate identity itself: [`ReportRow::module`] is an opaque display
-//! string. For S1 (single crate) [`rows_from_joined`] fills it via
-//! [`module_from_path`], a normalized-file-path **placeholder**. When S3 lands
-//! real crate-qualified names it swaps that one producer — [`format_report`]
-//! and its locked byte-for-byte output do not change.
+//! directly.** C14's second column is *Module*, an opaque display string the
+//! reporter is **told**: crate-qualified module naming (C3) needs package
+//! identity, which exists only in the discovery adapter, so that is where it is
+//! derived (T9/FC-T6a — this is no longer a placeholder). [`rows_from_joined`]
+//! is therefore a trivial projection, and [`format_report`] plus its locked
+//! byte-for-byte output are the only formatting in the pipeline.
 //!
 //! **Layout parity notes.** Go's `%-30s`/`%-35s` do not truncate — an
 //! over-long cell overflows and pushes the rest of the line right. Rust's
@@ -34,8 +32,8 @@ const TITLE: &str = "CRAP Report";
 pub(crate) struct ReportRow {
     /// Qualified function display name (`Function` column).
     pub(crate) name: String,
-    /// Opaque module display string (`Module` column). Supplied by the caller;
-    /// the reporter never derives crate identity itself (see module docs).
+    /// Crate-qualified module display string (`Module` column, C3). Supplied by
+    /// the caller; the reporter never derives crate identity itself.
     pub(crate) module: String,
     /// Source file path — **not** rendered by C14's table. Carried for the
     /// stable identity key (C15) the JSON contract needs (T11).
@@ -53,16 +51,15 @@ pub(crate) struct ReportRow {
     pub(crate) crap: Option<f64>,
 }
 
-/// Adapt joined functions into report rows, deriving the S1 placeholder module
-/// from each function's file path.
+/// Project joined functions onto report rows.
 ///
-/// S3/T9 replaces this adapter (not [`format_report`]) with one that supplies
-/// crate-qualified module names.
+/// Purely a field-for-field projection: the Module string is derived upstream
+/// (see the module docs), so nothing is computed here.
 pub(crate) fn rows_from_joined(fns: &[JoinedFunction]) -> Vec<ReportRow> {
     fns.iter()
         .map(|f| ReportRow {
             name: f.name.clone(),
-            module: module_from_path(&f.file),
+            module: f.module.clone(),
             file: f.file.clone(),
             start_line: f.start_line,
             complexity: f.complexity,
@@ -139,21 +136,6 @@ fn format_crap(crap: Option<f64>) -> String {
         Some(c) => format!("{c:>8.1}"),
         None => "     N/A".to_string(),
     }
-}
-
-/// **S1 placeholder** module string: the source path, normalized to forward
-/// slashes with any leading `./` removed.
-///
-/// Deliberately *not* a crate-qualified module name — that is C3/S3 (T9), which
-/// needs package identity the join does not carry (FC-T5e). Showing the
-/// normalized path keeps the column honest and obviously provisional instead of
-/// inventing a `::` name S3 would have to undo.
-fn module_from_path(file: &str) -> String {
-    let normalized = file.replace('\\', "/");
-    normalized
-        .strip_prefix("./")
-        .unwrap_or(&normalized)
-        .to_string()
 }
 
 #[cfg(test)]
@@ -284,10 +266,11 @@ an_extremely_long_function_name_well_past_thirty crate::deeply::nested::module::
     }
 
     #[test]
-    fn rows_from_joined_carries_values_and_placeholder_module() {
+    fn rows_from_joined_carries_values_and_the_crate_qualified_module() {
         let joined = vec![JoinedFunction {
             name: "Foo::bar".to_string(),
-            file: "./src/foo.rs".to_string(),
+            module: "demo::foo".to_string(),
+            file: "crates/demo/src/foo.rs".to_string(),
             start_line: 12,
             complexity: 3,
             coverage: Some(0.5),
@@ -296,33 +279,28 @@ an_extremely_long_function_name_well_past_thirty crate::deeply::nested::module::
         let rows = rows_from_joined(&joined);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "Foo::bar");
-        assert_eq!(rows[0].module, "src/foo.rs");
+        // C3: the Module column shows the crate-qualified module, not the path.
+        assert_eq!(rows[0].module, "demo::foo");
         assert_eq!(rows[0].complexity, 3);
         assert_eq!(rows[0].coverage, Some(0.5));
         assert_eq!(rows[0].crap, crate::crap::score(3, Some(0.5)));
     }
 
-    /// C15: the identity fields are carried through verbatim (un-normalized
-    /// `file`, plus `start_line`) alongside the display `module`.
+    /// C15: the identity fields are carried through verbatim (`file`, plus
+    /// `start_line`) alongside the display `module`.
     #[test]
     fn rows_from_joined_carries_c15_identity_fields() {
         let joined = vec![JoinedFunction {
             name: "Foo::bar".to_string(),
-            file: "./src/foo.rs".to_string(),
+            module: "demo::foo".to_string(),
+            file: "crates/demo/src/foo.rs".to_string(),
             start_line: 12,
             complexity: 3,
             coverage: Some(0.5),
             crap: crate::crap::score(3, Some(0.5)),
         }];
         let rows = rows_from_joined(&joined);
-        assert_eq!(rows[0].file, "./src/foo.rs");
+        assert_eq!(rows[0].file, "crates/demo/src/foo.rs");
         assert_eq!(rows[0].start_line, 12);
-    }
-
-    #[test]
-    fn module_placeholder_normalizes_path() {
-        assert_eq!(module_from_path("src/lib.rs"), "src/lib.rs");
-        assert_eq!(module_from_path("./src/lib.rs"), "src/lib.rs");
-        assert_eq!(module_from_path("src\\join.rs"), "src/join.rs");
     }
 }

@@ -12,3 +12,4 @@ mod crap;
 mod join;
 mod report;
 mod runner;
+mod workspace;

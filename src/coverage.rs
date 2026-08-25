@@ -53,26 +53,36 @@ pub(crate) struct LcovData {
 ///
 /// The variants carry *how* a file was matched, not just the key, so callers
 /// that must report the resolution (the CLI's stderr diagnostics) can tell an
-/// exact hit from a merely plausible suffix hit or an outright miss. The join
-/// only ever needs [`key`](Resolution::key).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// exact hit from a merely plausible suffix hit, an unresolvable tie, or an
+/// outright miss. The join only ever needs [`key`](Resolution::key).
+///
+/// [`Ambiguous`](Self::Ambiguous) carries its tied candidates, so this type is
+/// deliberately **not `Copy`**: a warning that says only "ambiguous" without
+/// naming what it was torn between is not actionable.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Resolution<'a> {
     /// The query matched a stored key exactly (after normalization).
     Exact(&'a str),
-    /// The query matched a stored key only by segment-wise suffix — plausible,
-    /// but not proof that it is the same file.
+    /// The query matched exactly one best (longest-overlap) key by segment-wise
+    /// suffix — plausible, but not proof that it is the same file.
     Suffix(&'a str),
+    /// Several stored keys match the query equally well (FC-T5a). Treated as
+    /// unresolved — [`key`](Self::key) is `None` — because picking one of them
+    /// would be arbitrary, and an arbitrary pick reports another file's
+    /// coverage numbers under this file's name.
+    Ambiguous(Vec<&'a str>),
     /// No stored key covers the query: the file is absent from the profile.
     Unresolved,
 }
 
 impl<'a> Resolution<'a> {
     /// The matching **stored** key, to be fed back into
-    /// [`LcovData::coverage_in_range`]; `None` when unresolved.
-    pub(crate) fn key(self) -> Option<&'a str> {
+    /// [`LcovData::coverage_in_range`]; `None` when there is no single
+    /// defensible key (unresolved, or ambiguous).
+    pub(crate) fn key(&self) -> Option<&'a str> {
         match self {
             Self::Exact(key) | Self::Suffix(key) => Some(key),
-            Self::Unresolved => None,
+            Self::Ambiguous(_) | Self::Unresolved => None,
         }
     }
 }
@@ -99,15 +109,19 @@ impl LcovData {
     /// Matching is path-separator- and `./`-insensitive (see [`normalize_path`]):
     /// 1. exact match on normalized keys; else
     /// 2. segment-wise **suffix** match — the shorter path's `/`-segments are a
-    ///    suffix of the longer's, **in either direction** (see [`is_suffix`]),
-    ///    e.g. `src/lib.rs` resolves an absolute `/abs/proj/src/lib.rs` key and
-    ///    vice-versa.
+    ///    suffix of the longer's, **in either direction** (see
+    ///    [`suffix_overlap`]), e.g. `src/lib.rs` resolves an absolute
+    ///    `/abs/proj/src/lib.rs` key and vice-versa. Among the candidates the
+    ///    **longest overlap** wins, and a genuine tie is
+    ///    [`Resolution::Ambiguous`] (FC-T5a) rather than an arbitrary pick:
+    ///    `src/lib.rs` exists in every workspace member, so "first key wins"
+    ///    silently attributes one member's coverage to another's functions.
     ///
     /// Step 2's bidirectionality is a **deliberate divergence** from crap4go —
-    /// see [`is_suffix`] for the verified upstream behaviour and the rationale.
-    /// The two-pass shape (exact, then suffix) matches upstream's
-    /// `segmentsForFile`; unlike Go's randomized map iteration, our `BTreeMap`
-    /// makes "first suffix hit wins" deterministic (lowest key order).
+    /// see [`suffix_overlap`] for the verified upstream behaviour and the
+    /// rationale. The two-pass shape (exact, then suffix) matches upstream's
+    /// `segmentsForFile`. Candidate order is `BTreeMap` order, so both the
+    /// winner and a reported tie are deterministic (FC-T6b).
     ///
     /// The raw key map stays private; the join owns this key space, so the
     /// normalization lives here rather than leaking the inner `BTreeMap`.
@@ -120,16 +134,28 @@ impl LcovData {
                 return Resolution::Exact(key.as_str());
             }
         }
-        // 2. Segment-wise suffix match.
+        // 2. Segment-wise suffix match, best (longest) overlap wins.
         let query_segs = segments(&query);
+        let mut best: Vec<&str> = Vec::new();
+        let mut best_overlap = 0;
         for key in self.files.keys() {
             let key_norm = normalize_path(key);
-            let key_segs = segments(&key_norm);
-            if is_suffix(&query_segs, &key_segs) {
-                return Resolution::Suffix(key.as_str());
+            let Some(overlap) = suffix_overlap(&query_segs, &segments(&key_norm)) else {
+                continue;
+            };
+            if overlap > best_overlap {
+                best_overlap = overlap;
+                best.clear();
+            }
+            if overlap == best_overlap {
+                best.push(key.as_str());
             }
         }
-        Resolution::Unresolved
+        match best.len() {
+            0 => Resolution::Unresolved,
+            1 => Resolution::Suffix(best[0]),
+            _ => Resolution::Ambiguous(best),
+        }
     }
 
     /// Coverage over the inclusive line range `[start_line, end_line]` of `file`.
@@ -255,8 +281,13 @@ fn segments(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
 }
 
-/// True when the shorter segment list is a suffix of the longer, **in either
-/// direction**. Empty lists never match.
+/// How many trailing segments two paths share, when one segment list is a
+/// suffix of the other **in either direction**; `None` when neither is (and for
+/// empty lists, which never match).
+///
+/// The overlap is what makes "longest wins" possible: a query matching a key on
+/// four trailing segments is a far better guess than one matching on two
+/// (FC-T5a).
 ///
 /// **Deliberate divergence from crap4go — verified.** Upstream's `suffixMatch`
 /// (`internal/coverage/coverage.go`, `unclebob/crap4go` @ `bee16db`) is
@@ -265,10 +296,11 @@ fn segments(path: &str) -> Vec<&str> {
 /// suffix of the profile key, never the reverse. We match both ways on purpose:
 /// LCOV `SF:` keys are typically short and repo-relative while the CC engine
 /// reports absolute paths, so the one-directional rule would fail to resolve
-/// and report `N/A` for essentially every function.
-fn is_suffix(a: &[&str], b: &[&str]) -> bool {
+/// and report `N/A` for essentially every function. Upstream also takes the
+/// first match; we take the longest and refuse to guess on a tie.
+fn suffix_overlap(a: &[&str], b: &[&str]) -> Option<usize> {
     let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
-    !short.is_empty() && long.ends_with(short)
+    (!short.is_empty() && long.ends_with(short)).then_some(short.len())
 }
 
 #[cfg(test)]
@@ -439,9 +471,62 @@ end_of_record
     }
 
     #[test]
+    fn resolve_path_prefers_the_longest_overlapping_key() {
+        // FC-T5a: both keys are segment-wise suffixes of the query, but only
+        // one of them agrees on the member directory. The shorter candidate
+        // sorts first, so "first key wins" would have picked it.
+        let data = parse_lcov(
+            "SF:alpha/src/lib.rs\nDA:1,3\nend_of_record\n\
+             SF:crates/alpha/src/lib.rs\nDA:1,3\nend_of_record\n",
+        )
+        .expect("valid LCOV");
+        assert_eq!(
+            data.resolve_path("proj/crates/alpha/src/lib.rs"),
+            Resolution::Suffix("crates/alpha/src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn resolve_path_reports_an_equal_overlap_tie_as_ambiguous() {
+        // FC-T5a: `src/lib.rs` exists in every workspace member, so a short
+        // query overlaps each member's key equally well. Picking the first
+        // would silently report beta's coverage for alpha's functions.
+        let data = parse_lcov(
+            "SF:crates/alpha/src/lib.rs\nDA:1,3\nend_of_record\n\
+             SF:crates/beta/src/lib.rs\nDA:1,0\nend_of_record\n",
+        )
+        .expect("valid LCOV");
+        assert_eq!(
+            data.resolve_path("src/lib.rs"),
+            Resolution::Ambiguous(vec!["crates/alpha/src/lib.rs", "crates/beta/src/lib.rs"])
+        );
+    }
+
+    #[test]
+    fn an_exact_match_beats_an_otherwise_ambiguous_tie() {
+        // The tie only matters when nothing matched exactly; an exact key is
+        // still the answer even though both members carry `src/lib.rs`.
+        let data = parse_lcov(
+            "SF:crates/alpha/src/lib.rs\nDA:1,3\nend_of_record\n\
+             SF:crates/beta/src/lib.rs\nDA:1,0\nend_of_record\n",
+        )
+        .expect("valid LCOV");
+        assert_eq!(
+            data.resolve_path("crates/beta/src/lib.rs"),
+            Resolution::Exact("crates/beta/src/lib.rs")
+        );
+    }
+
+    #[test]
     fn resolution_key_exposes_the_stored_key() {
         assert_eq!(Resolution::Exact("src/a.rs").key(), Some("src/a.rs"));
         assert_eq!(Resolution::Suffix("src/a.rs").key(), Some("src/a.rs"));
         assert_eq!(Resolution::Unresolved.key(), None);
+        // FC-T5a: an ambiguous match is unresolved for join purposes, so the
+        // C13 join contract needs no new case — those functions report N/A.
+        assert_eq!(
+            Resolution::Ambiguous(vec!["a/src/lib.rs", "b/src/lib.rs"]).key(),
+            None
+        );
     }
 }

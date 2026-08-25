@@ -1,7 +1,7 @@
 <!-- Save as docs/features/<nnn>-<feature_name>.md — <nnn> = zero-padded next sequence number (highest existing + 1). -->
 # Feature: crap4rust — CRAP-metric quality gate for Rust
 **Branch:** vibe/001-crap4rust
-**Status:** In progress — S1 (walking skeleton) complete; next slice S2
+**Status:** In progress — S1 + S2 complete; S3 in progress (T9 done, T10 next)
 
 ## Requirements
 
@@ -81,11 +81,11 @@ One or more tasks per slice.
 | T6  | S1 | **Table reporter** — header "CRAP Report", 5 columns, crap4go layout parity. | **Done** | vibe/001 |
 | T7  | S1 | **CLI skeleton** — arg parse, wire pipeline, `--lcov-path`. Also lands C15 (identity fields). | **Done** | vibe/001 |
 | T8  | S2 | **Coverage runner** — invoke `cargo llvm-cov` → default `target/crap4rust/coverage.lcov`; `--test-command` override; zero-config default (C2). Makes `--lcov-path` optional — `missing_required_lcov_arg_exits_one` legitimately changes (expected evolution, not a regression). | **Done** | vibe/001 |
-| T9  | S3 | **Workspace enumeration** — cargo metadata; per-member modules, crate-qualified (C3). Checklist: replace `report::rows_from_joined` module derivation (FC-T6a); move source discovery out of `cli.rs` into its adapter; FC-T5a longest-overlap + `Ambiguous` resolution; FC-T5e `SourceUnit` refactor. | Pending | - |
+| T9  | S3 | **Workspace enumeration** — cargo metadata; per-member modules, crate-qualified (C3). Checklist: replace `report::rows_from_joined` module derivation (FC-T6a); move source discovery out of `cli.rs` into its adapter; FC-T5a longest-overlap + `Ambiguous` resolution; FC-T5e `SourceUnit` refactor. | **Done** | vibe/001 |
 | T10 | S3 | **Product/test filtering** — exclude `#[cfg(test)]`/`#[test]`; `tests/`/`benches/`/`examples/` non-product; positional path-fragment filters (C5). | Pending | - |
 | T11 | S4 | **JSON reporter** — versioned schema (`schema_version`), stable field contract. | Pending | - |
 | T12 | S5 | **Parallelism** — `rayon` across members/files; `-j/--jobs`, full CPUs default (C7). | Pending | - |
-| T13 | S5 | **Docs & limits** — async/macro CC caveats (C12), README, `--help`. | Pending | - |
+| T13 | S5 | **Docs & limits** — async/macro CC caveats (C12), README, `--help`. Must document: FC-T8f "no spaces in `--test-command`" (workaround `--lcov-path`); the C17 crap4go `--test-command` divergences + `{lcov}` vs `{coverprofile}` migration note; FC-T5c (`total==0` renders `100.0%`); C15 duplicate-display-name rows. | Pending | - |
 
 ### Test expectations (inline)
 
@@ -195,12 +195,12 @@ Forward constraints:
   artifact vs per-root — a single `DEFAULT_LCOV_PATH` across roots lets later roots clobber earlier.
   Coverage is **workspace-wide, one run per invocation** (`cargo llvm-cov` is workspace-aware);
   discovery goes per-member, coverage generation does not.
-- **FC-T8f (argv escape hatch — PROMOTED, needs a human scope call).** Repeatable
-  `--test-command-arg` (one argv element per occurrence, no splitting, `{lcov}` still substituted,
-  mutually exclusive with `--test-command`) is the sanctioned answer to spaces-in-paths — the gap
-  bites hardest on Windows, the very platform we chose argv for. **Land it before S2 closes, or T13
-  documents "no spaces in `--test-command`" as a known limit.** A shell variant (`sh -c`/`cmd /c`) is
-  **rejected**: platform-split, injection surface, untestable on half the CI matrix.
+- **FC-T8f (argv escape hatch — **RESOLVED (human, 2026-08-24): NOT BUILT**).** Repeatable
+  `--test-command-arg` was the sanctioned answer to spaces-in-paths (the gap bites hardest on Windows,
+  the very platform we chose argv for). **Human ruling: ship v1 without it** — T13 documents "no spaces
+  in `--test-command`" as a known limit, with `--lcov-path` as the workaround. A shell variant
+  (`sh -c`/`cmd /c`) is **rejected**: platform-split, injection surface, untestable on half the CI
+  matrix. Revisit post-v1 if it bites a real user.
 - **FC-T8g (advisory carrier; binds FC-T7e).** `RunConfig::advisories()` is pre-rendered
   `Vec<String>`, stderr-only, and **must be drained by every entrypoint before calling `cli::run`** —
   `main` does; a T11 JSON frontend must too, or resolution warnings vanish. Advisories are facts about
@@ -208,6 +208,95 @@ Forward constraints:
   about the **run** (only exist on `Ok`) — hence the deliberate split, with FC-T7b intact. If T11 rules
   warnings belong inside the JSON document, `advisories` **and** `diagnostics` convert to a structured
   type **together**, before `schema_version` freezes. Do not convert one alone.
+
+### T9 review notes (Bhaskar FAIL ×3 → PASS; Anders — approve-with-suggestions, 2026-08-24)
+
+T9 replaces the T7 `src`-scan placeholder with a **rustc-style module-graph BFS**. `cargo metadata`
+enumerates members and their **product targets**; from each target's `src_path` the walk resolves
+`mod` declarations rather than scanning directories. `Scope{segments, dir, relative}` models rustc's
+`DirOwnership::Owned{relative}` — a crate root and a `mod.rs` own their directory, a file module
+`foo.rs` gets `relative = Some("foo")`. Names come from the graph (`scope.segments.join("::")`),
+**never** from the filesystem. Orphan files unreachable from a root are not analysed; nonstandard
+roots (`cmd/tool.rs`) enumerate correctly; `lib.rs`/`main.rs`/`mod.rs` naming falls out with no
+special-casing. `discover` returns `Discovery{sources, diagnostics}`, prepended to `RunOutput`.
+
+**Three defect rounds, all silently-wrong-answer or worse:**
+1. **Many-to-one LCOV attribution** — per-file resolution structurally cannot see two sources claiming
+   one key (each query has one candidate, so never a tie). One member reported **another member's**
+   coverage as a confident number. Fixed by a whole-join claim map in `join::join` ⇒
+   `Attribution{Resolved, Collision}`; contested files report N/A with all claimants named.
+2. **Orphans, nonstandard roots, per-package-only dedup** — the original directory walk analysed files
+   rustc never compiles and silently omitted modules under nonstandard roots. Fixed by the rewrite.
+3. **Unbounded `#[path]` recursion — a hang.** `visited` keyed on the raw `PathBuf`, so
+   `#[path = "../src/lib.rs"] mod again;` produced `src/lib.rs`, `src/../src/lib.rs`, … — endlessly
+   distinct keys reading one file. Now keyed on `fs::canonicalize` identity. A hang is worse than a
+   wrong number: there is no output to inspect.
+
+**Decline policy.** `#[cfg_attr(windows, path = "windows.rs")] mod imp;` selects its source file by a
+cfg set we do not evaluate. We **decline**: the module and its whole subtree are unmeasured and stderr
+says so. Analysing the default would emit ordinary rows for a file rustc may never compile —
+indistinguishable from correct output in the frozen C14 table. Standing bar: **we may decline to
+answer, but never answer confidently and wrongly.** Canonicalization failure on a queued file is an
+**operational error (exit 1)**, not a decline — same class as an unreadable file, and the only bounded
+answer. All three advisory conditions (missing module file naming both candidates; `foo.rs` **and**
+`foo/mod.rs` both present; conditional path) are exit-code-neutral per C6.
+
+Forward constraints:
+- **FC-T9a (module/name semantics — settle before `schema_version` freezes).** `module` and `name`
+  split the module path at **different points** for inline vs. file modules: `src/foo/inner.rs` gives
+  `module = "demo::foo::inner"`, `name = "bar"`, but `mod inner { fn bar() }` inline in `src/foo.rs`
+  gives `module = "demo::foo"`, `name = "inner::bar"`. Concatenated they are always right;
+  individually **neither field has a stable meaning**. Invisible in the table, fatal in JSON.
+  Blocking for T11, not for T9.
+- **FC-T9b (per-row coverage caveat).** `coverage: null` cannot distinguish *absent from profile* /
+  *ambiguous* / *contested* — three different user actions. `JoinedFunction` must carry its file's
+  attribution before T11; T11 must **not** re-join attributions to rows by path string.
+- **FC-T9c (declined work is in-document).** A declined subtree is simply absent from `functions[]`,
+  so a machine consumer computing workspace CRAP is silently wrong. T11's JSON carries a structured
+  top-level `warnings[]`.
+- **FC-T9d (one diagnostic type, one sink; binds FC-T7e/FC-T8g).** Advisories + diagnostics become a
+  single `Diagnostic{code, severity, phase, site, kind}` with `Display` preserving today's bytes,
+  drained by `main` **on `Err` as well as `Ok`** — today discovery diagnostics are **lost** when a
+  later stage fails, so a workspace with three unresolvable modules *and* one unparseable file prints
+  only the error. Convert together, never one alone. Land before T11.
+- **FC-T9e (query key ≠ display path).** `workspace_relative` emits `../shared/tool.rs` for members
+  above the root; `suffix_overlap` matches on segments including the literal `".."`, which no absolute
+  LCOV key can end with — so out-of-root members are **permanently N/A**. One string is doing two
+  jobs (C15 display identity **and** LCOV query key). FC-T7a binds the *reported* path, not the
+  *query*. Resolve at T10/T11 via `SourceFile::absolute` or a `..`-stripped query key.
+- **FC-T9f (evidence ranking in collisions — human ruling).** `claimants.len() > 1` ⇒ `Collision`
+  regardless of *how* each claimant matched, so one sloppy `Suffix` claim demotes another file's
+  `Exact` match to N/A — discarding `Resolution` evidence at the moment it is most valuable.
+- **FC-T9g (T10 filters units, not just functions).** A file whose entire content is `#[cfg(test)]`
+  yields zero functions but, if it survives as a `SourceUnit`, still **stakes a claim on an LCOV key**
+  — manufacturing a `Collision` that N/As a real file, and emitting attribution diagnostics for a file
+  with no rows. Drop the empty unit **before** the join. Also: missing-module diagnostics for
+  `#[cfg(test)] mod tests;` become noise post-T10 — suppress or downgrade.
+- **FC-T9h (single-parse streaming — land before T12).** Files are parsed **twice** (declarations,
+  then measurement) by **two different modules**, with near-duplicate error contexts and two
+  independent owners of "what is an operational error". Do not thread whole ASTs (peak memory = every
+  `syn::File` at once); **stream** them — `complexity::analyze_file(&syn::File)` already exists and
+  `workspace` already holds the right AST at the right moment. One parse per file, peak memory one
+  AST; under T12 that is *J* ASTs bounded by `--jobs`. Defines the rayon unit of work, so doing it
+  after T12 means writing the parallel structure twice.
+- **FC-T9i (enumeration stays sequential).** Graph BFS and workspace dedup are order-dependent by
+  design (first claimant owns) — that is what makes FC-T6b determinism hold. Enumeration is I/O-bound
+  `is_file`/`canonicalize` probes, not CPU. T12 parallelises **measurement only**, order-preserving
+  `map`/`collect`, never `par_bridge`.
+- **FC-T9j (PATH is a locator — human ruling).** Positional `PATH` no longer scopes analysis: it
+  locates the workspace, and the whole workspace is analysed. Between T9 and T10 the tool
+  **over-reports against user intent** — `crap4rust crates/alpha` now analyses everything. C5's
+  path-fragment filters are the way back, but the positional is then overloaded as locator *and*
+  filter, which is not defensible.
+- **FC-T9k (split the two concerns).** `workspace.rs` fuses *workspace/target enumeration* (cargo's
+  schema) with *module-graph resolution* (rustc's rules) in 1261 lines — two reasons to change.
+  Suggested pure file split: `workspace/mod.rs` + `workspace/modgraph.rs`, resolver surface
+  `walk(root, crate_ident, workspace_root)`. Do **not** abstract the filesystem behind a trait — the
+  temp-tree `Tree` harness is the right fidelity; a mock FS would be YAGNI and less truthful.
+- **FC-T9l (T13 documentation debt).** Orphan `.rs` files are not analysed (a **behaviour change**
+  from S1's directory walk — a user may notice a file "disappear"); declined conditionally-pathed
+  subtrees are unmeasured; `PATH` is a locator, not a scope; **the report may be silently incomplete
+  without reading stderr**; out-of-root members report `..` paths and today N/A coverage.
 
 ### C16 — Bidirectional path matching — **DELIBERATE DIVERGENCE (verified, 2026-08-24)**
 

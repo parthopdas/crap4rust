@@ -16,3 +16,7 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 # Contextual error chaining at the CLI edge (exit-code 1 operational errors).
 anyhow = "1"
+# `cargo metadata` output is JSON; `derive` lets the workspace adapter name the
+# handful of fields it consumes and ignore the rest of the schema.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

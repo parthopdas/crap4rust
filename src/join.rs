@@ -16,15 +16,21 @@
 //!    documented divergence — see [`LcovData::resolve_path`]), and keep the
 //!    file-absent vs file-present distinction all the way to the join contract.
 //!    The *exactness* of each match is carried out as data
-//!    ([`JoinResult::resolutions`]) so the CLI can emit a stderr diagnostic
+//!    ([`JoinResult::attributions`]) so the CLI can emit a stderr diagnostic
 //!    (FC-T5b) — this module never prints.
+//!    Resolution is decided over the **whole join**, not per file in isolation:
+//!    see [`Attribution`] for why one LCOV record may never be attributed to
+//!    two different source files.
 //! 2. **The C13 join contract** — file-absent ⇒ `None` (N/A, unscored);
 //!    file-present with no instrumented lines (`total==0`) ⇒ `Some(1.0)` (the
 //!    deliberate divergence from crap4go); otherwise `Some(covered/total)`.
 //!
-//! Sorting, `N/A`-last ordering, the table columns (C14), and the "Module"
-//! display string (C3/S3) are the reporter's job (T6/T7), not this module — we
-//! only carry `file` and `start_line` through.
+//! Sorting, `N/A`-last ordering and the table columns (C14) are the reporter's
+//! job (T6/T7), not this module — we only carry the crate-qualified `module`
+//! (C3, derived upstream by the discovery adapter), `file` and `start_line`
+//! through.
+
+use std::collections::BTreeMap;
 
 use crate::complexity::FunctionComplexity;
 use crate::coverage::{LcovData, Resolution};
@@ -35,8 +41,11 @@ use crate::crap;
 pub(crate) struct JoinedFunction {
     /// Qualified display name, carried straight from [`FunctionComplexity`].
     pub(crate) name: String,
-    /// Source file path (as given to the join). Carried through for T6/T7
-    /// "Module" derivation; not normalized here.
+    /// Crate-qualified module path of the owning source unit (C3), carried
+    /// through for the reporter's Module column.
+    pub(crate) module: String,
+    /// Source file path (as given to the join). Carried through for the C15
+    /// identity key; not normalized here.
     pub(crate) file: String,
     /// 1-based start line of the function, carried straight from
     /// [`FunctionComplexity`]. With `file` it forms the stable identity key
@@ -52,63 +61,156 @@ pub(crate) struct JoinedFunction {
     pub(crate) crap: Option<f64>,
 }
 
-/// The join's output: the per-function results plus the per-file path
-/// resolutions that produced them.
+/// One analysed source file: the functions the CC engine found in it, plus the
+/// identity the CC engine does not carry — which package's module this file is,
+/// and the path it is known by.
+///
+/// This replaces the anonymous `(String, Vec<FunctionComplexity>)` tuple
+/// (FC-T5e). `module` is **crate-qualified** (C3) and is derived upstream, in
+/// the discovery adapter where package identity actually exists — the join and
+/// the reporter only carry it. The crate name is the module's first segment, so
+/// package identity is present without a second, write-only field.
+pub(crate) struct SourceUnit {
+    /// Crate-qualified module path (C3), e.g. `demo::foo::bar`.
+    pub(crate) module: String,
+    /// The path this file is known by — workspace-relative and forward-slashed
+    /// as produced by discovery. Both the LCOV query key and the C15 identity
+    /// `file`.
+    pub(crate) path: String,
+    /// The functions the CC engine found in this file.
+    pub(crate) functions: Vec<FunctionComplexity>,
+}
+
+/// What one source file's coverage was finally attributed to, over the
+/// **complete** join.
+///
+/// [`LcovData::resolve_path`] answers one query at a time, so it can only ever
+/// see one side of a many-to-one mapping: with a single `SF:src/lib.rs` record,
+/// every member's `src/lib.rs` resolves to it, each query finding exactly one
+/// candidate and therefore never a tie. Every member would then be scored from
+/// the *same* record — confidently, and for all but one of them wrongly.
+///
+/// So attribution is settled here, where the whole join is visible: an LCOV
+/// record claimed by more than one distinct source path belongs to none of them
+/// ([`Collision`](Self::Collision), reported and unscored), because nothing in
+/// the data proves which file it describes. An LCOV path is only ever relative
+/// to *its* build root, which we do not know — so even a byte-for-byte match on
+/// a workspace-relative path is not proof of ownership once a second file
+/// claims the same record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Attribution<'a> {
+    /// The file's own resolution stands: it is the only claimant of its key (or
+    /// it has no key at all — absent, or an ambiguous tie).
+    Resolved(Resolution<'a>),
+    /// Several distinct source paths claim one LCOV record, so it is attributed
+    /// to none of them: their functions report `N/A` (C13).
+    Collision {
+        /// The contested LCOV key.
+        key: &'a str,
+        /// Every source path claiming it, in join input order.
+        sources: Vec<String>,
+    },
+}
+
+impl<'a> Attribution<'a> {
+    /// The LCOV key this file's coverage may be read from; `None` whenever
+    /// there is no single defensible record — absent, ambiguous, or contested.
+    fn key(&self) -> Option<&'a str> {
+        match self {
+            Self::Resolved(resolution) => resolution.key(),
+            Self::Collision { .. } => None,
+        }
+    }
+}
+
+/// The join's output: the per-function results plus the per-file attributions
+/// that produced them.
 pub(crate) struct JoinResult<'a> {
     /// One entry per input function, in input order.
     pub(crate) functions: Vec<JoinedFunction>,
-    /// One entry per input file, in input order: the path as given, and how it
-    /// resolved against the LCOV key space (FC-T5b). Borrowed keys point into
-    /// the [`LcovData`] the join was run against.
-    pub(crate) resolutions: Vec<(String, Resolution<'a>)>,
+    /// One entry per input file, in input order: the path as given, and what
+    /// its coverage was attributed to (FC-T5b). Borrowed keys point into the
+    /// [`LcovData`] the join was run against.
+    pub(crate) attributions: Vec<(String, Attribution<'a>)>,
 }
 
 /// Join per-file CC results against `lcov`, producing one [`JoinedFunction`]
-/// per input function plus how each input file's path resolved (FC-T5b).
+/// per input function plus how each input file's coverage was attributed
+/// (FC-T5b).
 ///
-/// `files` pairs each source file path with the functions the CC engine found
-/// in it — the association `FunctionComplexity` itself does not carry. Output
-/// order follows the input; sorting/formatting is the reporter's job (C14).
+/// Output order follows the input; sorting/formatting is the reporter's job
+/// (C14).
 ///
-/// The join stays **pure**: it *reports* resolution status as data and never
-/// prints. Turning a non-exact or unresolved match into a stderr diagnostic is
-/// the CLI edge's job.
-pub(crate) fn join<'a>(
-    lcov: &'a LcovData,
-    files: &[(String, Vec<FunctionComplexity>)],
-) -> JoinResult<'a> {
+/// Three passes, because attribution needs the whole join in view (see
+/// [`Attribution`]): resolve every file's path, collect the claims on each LCOV
+/// key, then score only the files whose claim is uncontested. Both the claim
+/// map (`BTreeMap`) and the per-key claimant lists (input order) are
+/// deterministic (FC-T6b).
+///
+/// The join stays **pure**: it *reports* attribution as data and never prints.
+/// Turning a non-exact, ambiguous, contested or unresolved match into a stderr
+/// diagnostic is the CLI edge's job.
+pub(crate) fn join<'a>(lcov: &'a LcovData, units: &[SourceUnit]) -> JoinResult<'a> {
+    // 1. Resolve each file once — not once per function.
+    let resolved: Vec<Resolution<'a>> = units
+        .iter()
+        .map(|unit| lcov.resolve_path(&unit.path))
+        .collect();
+
+    // 2. Who claims which LCOV record. Distinct *paths* only: the same file
+    //    listed twice is one claimant, not a collision with itself.
+    let mut claims: BTreeMap<&'a str, Vec<String>> = BTreeMap::new();
+    for (unit, resolution) in units.iter().zip(&resolved) {
+        if let Some(key) = resolution.key() {
+            let claimants = claims.entry(key).or_default();
+            if !claimants.contains(&unit.path) {
+                claimants.push(unit.path.clone());
+            }
+        }
+    }
+
+    // 3. Score, skipping every file whose record is claimed by someone else too.
     let mut functions = Vec::new();
-    let mut resolutions = Vec::new();
-    for (file, fns) in files {
-        // Resolve the file once per file, not per function.
-        let resolved = lcov.resolve_path(file);
-        resolutions.push((file.clone(), resolved));
-        for fc in fns {
-            let coverage = coverage_for(lcov, resolved, fc);
+    let mut attributions = Vec::new();
+    for (unit, resolution) in units.iter().zip(resolved) {
+        let attribution = match resolution.key().map(|key| (key, &claims[key])) {
+            Some((key, claimants)) if claimants.len() > 1 => Attribution::Collision {
+                key,
+                sources: claimants.clone(),
+            },
+            _ => Attribution::Resolved(resolution),
+        };
+        let key = attribution.key();
+        for fc in &unit.functions {
+            let coverage = coverage_for(lcov, key, fc);
             let crap = crap::score(fc.complexity, coverage);
             functions.push(JoinedFunction {
                 name: fc.name.clone(),
-                file: file.clone(),
+                module: unit.module.clone(),
+                file: unit.path.clone(),
                 start_line: fc.start_line,
                 complexity: fc.complexity,
                 coverage,
                 crap,
             });
         }
+        attributions.push((unit.path.clone(), attribution));
     }
     JoinResult {
         functions,
-        resolutions,
+        attributions,
     }
 }
 
-/// Apply the C13 contract for one function given its file's resolution result.
+/// Apply the C13 contract for one function given its file's attributed LCOV key.
 ///
 /// The returned `Some` fraction is always in `[0.0, 1.0]` and never NaN:
 /// `covered ≤ total` by construction in [`LcovData::coverage_in_range`], and
 /// the `total == 0` branch short-circuits before any division (FC-T4b).
-fn coverage_for(lcov: &LcovData, resolved: Resolution<'_>, fc: &FunctionComplexity) -> Option<f64> {
-    let key = resolved.key()?; // file absent ⇒ None (N/A, unscored).
+fn coverage_for(lcov: &LcovData, key: Option<&str>, fc: &FunctionComplexity) -> Option<f64> {
+    // No defensible key (file absent, an ambiguous tie, or a record contested
+    // by another source file) ⇒ None: N/A, unscored.
+    let key = key?;
     let (covered, total) =
         lcov.coverage_in_range(key, line_to_u32(fc.start_line), line_to_u32(fc.end_line));
     if total == 0 {
@@ -156,9 +258,17 @@ end_of_record
         }
     }
 
+    fn unit(path: &str, functions: Vec<FunctionComplexity>) -> SourceUnit {
+        SourceUnit {
+            module: "demo".to_string(),
+            path: path.to_string(),
+            functions,
+        }
+    }
+
     fn join_one(file: &str, fc: FunctionComplexity) -> JoinedFunction {
         let lcov = parse_lcov(FIXTURE).expect("valid fixture");
-        let mut out = join(&lcov, &[(file.to_string(), vec![fc])]).functions;
+        let mut out = join(&lcov, &[unit(file, vec![fc])]).functions;
         assert_eq!(out.len(), 1);
         out.pop().unwrap()
     }
@@ -196,6 +306,125 @@ end_of_record
     }
 
     #[test]
+    fn the_crate_qualified_module_is_carried_through() {
+        // C3/FC-T6a: the Module string is derived upstream and only carried
+        // here — the join never looks at the file path to invent one.
+        let lcov = parse_lcov(FIXTURE).expect("valid fixture");
+        let units = vec![SourceUnit {
+            module: "alpha::foo".to_string(),
+            path: "crates/alpha/src/foo.rs".to_string(),
+            functions: vec![fc("f", 1, 10, 13)],
+        }];
+        let joined = join(&lcov, &units).functions;
+        assert_eq!(joined[0].module, "alpha::foo");
+        assert_eq!(joined[0].file, "crates/alpha/src/foo.rs");
+    }
+
+    #[test]
+    fn an_ambiguous_path_is_unscored_and_reported() {
+        // FC-T5a: two members' keys match the query equally well, so there is
+        // no defensible coverage to report — N/A (C13), plus the tie as data.
+        let lcov = parse_lcov(
+            "SF:crates/alpha/src/lib.rs\nDA:10,1\nend_of_record\n\
+             SF:crates/beta/src/lib.rs\nDA:10,0\nend_of_record\n",
+        )
+        .expect("valid fixture");
+        let result = join(&lcov, &[unit("src/lib.rs", vec![fc("f", 3, 10, 13)])]);
+
+        assert_eq!(result.functions[0].coverage, None);
+        assert_eq!(result.functions[0].crap, None);
+        assert_eq!(
+            result.attributions,
+            vec![(
+                "src/lib.rs".to_string(),
+                Attribution::Resolved(Resolution::Ambiguous(vec![
+                    "crates/alpha/src/lib.rs",
+                    "crates/beta/src/lib.rs"
+                ]))
+            )]
+        );
+    }
+
+    /// Defect 3 (the many-to-one case `resolve_path` cannot see): a single LCOV
+    /// record and two members whose paths both resolve to it. Each query has
+    /// exactly one candidate, so neither is *ambiguous* — yet the record can
+    /// describe only one of them, and nothing says which. Both must be N/A.
+    #[test]
+    fn one_lcov_record_claimed_by_two_sources_is_a_collision_and_unscored() {
+        let lcov = parse_lcov("SF:src/lib.rs\nDA:10,1\nend_of_record\n").expect("valid fixture");
+        let units = vec![
+            SourceUnit {
+                module: "alpha".to_string(),
+                path: "src/lib.rs".to_string(),
+                functions: vec![fc("alpha_one", 2, 10, 13)],
+            },
+            SourceUnit {
+                module: "beta".to_string(),
+                path: "crates/beta/src/lib.rs".to_string(),
+                functions: vec![fc("beta_one", 1, 10, 13)],
+            },
+        ];
+        let result = join(&lcov, &units);
+
+        for joined in &result.functions {
+            assert_eq!(joined.coverage, None, "{} was scored", joined.name);
+            assert_eq!(joined.crap, None, "{} was scored", joined.name);
+        }
+        let sources = vec![
+            "src/lib.rs".to_string(),
+            "crates/beta/src/lib.rs".to_string(),
+        ];
+        assert_eq!(
+            result.attributions,
+            vec![
+                (
+                    "src/lib.rs".to_string(),
+                    Attribution::Collision {
+                        key: "src/lib.rs",
+                        sources: sources.clone(),
+                    }
+                ),
+                (
+                    "crates/beta/src/lib.rs".to_string(),
+                    Attribution::Collision {
+                        key: "src/lib.rs",
+                        sources,
+                    }
+                ),
+            ]
+        );
+    }
+
+    /// The other half of defect 3: an uncontested record is still scored — the
+    /// collision guard must not turn every suffix match into N/A.
+    #[test]
+    fn one_record_per_source_is_still_scored() {
+        let lcov = parse_lcov(
+            "SF:/build/crates/alpha/src/lib.rs\nDA:10,1\nend_of_record\n\
+             SF:/build/crates/beta/src/lib.rs\nDA:10,0\nend_of_record\n",
+        )
+        .expect("valid fixture");
+        let units = vec![
+            SourceUnit {
+                module: "alpha".to_string(),
+                path: "crates/alpha/src/lib.rs".to_string(),
+                functions: vec![fc("alpha_one", 1, 10, 13)],
+            },
+            SourceUnit {
+                module: "beta".to_string(),
+                path: "crates/beta/src/lib.rs".to_string(),
+                functions: vec![fc("beta_one", 1, 10, 13)],
+            },
+        ];
+        let result = join(&lcov, &units);
+
+        // Each member's longest overlap is its own key, so no record is
+        // contested and both suffix matches are still scored.
+        assert_eq!(result.functions[0].coverage, Some(1.0));
+        assert_eq!(result.functions[1].coverage, Some(0.0));
+    }
+
+    #[test]
     fn total_zero_is_one_c13_divergence() {
         // File present but the fn's range has no instrumented (DA) lines.
         // C13: total==0 ⇒ cov=1 (divergence from crap4go's 0.0).
@@ -222,8 +451,8 @@ end_of_record
     #[test]
     fn produced_coverage_is_within_unit_interval() {
         let lcov = parse_lcov(FIXTURE).expect("valid fixture");
-        let files = vec![(
-            "src/lib.rs".to_string(),
+        let files = vec![unit(
+            "src/lib.rs",
             vec![
                 fc("partial", 2, 10, 13),
                 fc("full", 4, 20, 21),
@@ -240,35 +469,38 @@ end_of_record
     }
 
     #[test]
-    fn resolutions_report_one_status_per_file_in_input_order() {
-        // FC-T5b: the join surfaces *how* each file resolved, one entry per
-        // source file (not per function), without printing anything.
+    fn attributions_report_one_status_per_file_in_input_order() {
+        // FC-T5b: the join surfaces *how* each file's coverage was attributed,
+        // one entry per source file (not per function), without printing.
         let lcov = parse_lcov(FIXTURE).expect("valid fixture");
         let files = vec![
-            (
-                "src/lib.rs".to_string(),
+            unit(
+                "src/lib.rs",
                 vec![fc("exact_a", 1, 10, 13), fc("exact_b", 1, 20, 21)],
             ),
-            (
-                "/abs/proj/src/lib.rs".to_string(),
-                vec![fc("sfx", 1, 10, 13)],
-            ),
-            ("src/other.rs".to_string(), vec![fc("gone", 1, 10, 13)]),
+            unit("crates/demo/src/other.rs", vec![fc("gone_a", 1, 10, 13)]),
+            unit("src/other.rs", vec![fc("gone_b", 1, 10, 13)]),
         ];
         let result = join(&lcov, &files);
 
         assert_eq!(
-            result.resolutions,
+            result.attributions,
             vec![
-                ("src/lib.rs".to_string(), Resolution::Exact("src/lib.rs")),
                 (
-                    "/abs/proj/src/lib.rs".to_string(),
-                    Resolution::Suffix("src/lib.rs")
+                    "src/lib.rs".to_string(),
+                    Attribution::Resolved(Resolution::Exact("src/lib.rs"))
                 ),
-                ("src/other.rs".to_string(), Resolution::Unresolved),
+                (
+                    "crates/demo/src/other.rs".to_string(),
+                    Attribution::Resolved(Resolution::Unresolved)
+                ),
+                (
+                    "src/other.rs".to_string(),
+                    Attribution::Resolved(Resolution::Unresolved)
+                ),
             ]
         );
-        // The two functions in the first file yield a single resolution entry.
+        // The two functions in the first file yield a single attribution entry.
         assert_eq!(result.functions.len(), 4);
     }
 
@@ -337,7 +569,7 @@ DA:11,0
 end_of_record
 ";
         let lcov = parse_lcov(LCOV).expect("valid fixture");
-        let joined = join(&lcov, &[("src/demo.rs".to_string(), fns.clone())]).functions;
+        let joined = join(&lcov, &[unit("src/demo.rs", fns.clone())]).functions;
 
         let jf = |name: &str| {
             joined

@@ -1,12 +1,14 @@
-//! T7/T8 CLI exit-code integration tests (crap4go parity, C6).
+//! T7/T8/T9 CLI exit-code integration tests (crap4go parity, C6).
 //!
 //! Drives the real binary so exit codes, stdout, and stderr are asserted as the
 //! process actually emits them: `0` on success (even with high-CRAP functions),
 //! `1` on operational error only, report on stdout, errors on stderr.
 //!
-//! Fixtures are written to a per-test subdirectory of the cargo-provided target
-//! temp dir, so runs are deterministic and independent — no timing, no shared
-//! state, no external tooling.
+//! Fixtures are dependency-free cargo workspaces written to a per-test
+//! subdirectory of the cargo-provided target temp dir, so runs are
+//! deterministic and independent — no timing, no shared state, no network, and
+//! no external tooling (`cargo metadata --no-deps` resolves nothing, and no
+//! test ever invokes a real `cargo llvm-cov`, FC-T8b).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -80,15 +82,29 @@ DA:13,1
 end_of_record
 ";
 
-/// Create an isolated fixture directory containing `src/lib.rs` and
-/// `coverage.lcov`, and return its path.
+/// Create an isolated fixture directory containing a minimal cargo package
+/// (`Cargo.toml` + `src/lib.rs`) and `coverage.lcov`, and return its path.
+///
+/// The manifest is what makes this a workspace cargo metadata can resolve (A3):
+/// it declares its own `[workspace]`, so the fixture is self-contained rather
+/// than being drawn into whatever workspace encloses the target directory, and
+/// it has **no dependencies**, so `cargo metadata --no-deps` resolves nothing
+/// and touches no registry or network.
 fn fixture(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(dir.join("src")).expect("create fixture dir");
+    fs::write(dir.join("Cargo.toml"), manifest("demo")).expect("write fixture manifest");
     fs::write(dir.join("src").join("lib.rs"), SOURCE).expect("write fixture source");
     fs::write(dir.join("coverage.lcov"), LCOV).expect("write fixture lcov");
     dir
+}
+
+/// A dependency-free manifest for a package that is its own workspace root.
+fn manifest(package: &str) -> String {
+    format!(
+        "[package]\nname = \"{package}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n"
+    )
 }
 
 /// Run the built binary with `dir` as its working directory.
@@ -144,8 +160,8 @@ CRAP Report
 ===========
 Function                       Module                                CC    Cov%     CRAP
 ----------------------------------------------------------------------------------------
-risky                          src/lib.rs                             6    0.0%     42.0
-covered                        src/lib.rs                             1  100.0%      1.0
+risky                          demo                                   6    0.0%     42.0
+covered                        demo                                   1  100.0%      1.0
 "
     );
     assert_eq!(stderr_of(&out), "");
@@ -286,8 +302,8 @@ CRAP Report
 ===========
 Function                       Module                                CC    Cov%     CRAP
 ----------------------------------------------------------------------------------------
-risky                          src/lib.rs                             6    0.0%     42.0
-covered                        src/lib.rs                             1  100.0%      1.0
+risky                          demo                                   6    0.0%     42.0
+covered                        demo                                   1  100.0%      1.0
 "
     );
 }
@@ -521,4 +537,498 @@ fn unresolved_path_warns_on_stderr_and_still_exits_zero() {
         "stderr: {stderr}"
     );
     assert!(stderr.contains("N/A"), "stderr: {stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// T9 — workspace enumeration (C3/A3), crate-qualified modules, and the
+// cross-member path collision guard (FC-T5a).
+// ---------------------------------------------------------------------------
+
+/// Root-package source. `alpha_one` spans lines 1..=3 with one instrumented
+/// line (2), and CC = base 1 + `if` = 2.
+const ALPHA_SOURCE: &str = "\
+fn alpha_one(x: i32) -> i32 {
+    if x > 0 { 1 } else { 0 }
+}
+";
+
+/// Member source. `beta_one` spans lines 1..=3 with one instrumented line (2),
+/// and CC = 1.
+const BETA_SOURCE: &str = "\
+fn beta_one() -> i32 {
+    2
+}
+";
+
+/// A two-member workspace: the root package `alpha` plus the member `beta`
+/// under `crates/`. Both members have a `src/lib.rs` — the filename collision
+/// that is guaranteed in any real workspace and that S1 was immune to only
+/// because it analysed a single crate.
+fn workspace_fixture(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = fs::remove_dir_all(&dir);
+    let beta = dir.join("crates").join("beta");
+    fs::create_dir_all(dir.join("src")).expect("create root src");
+    fs::create_dir_all(beta.join("src")).expect("create member src");
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+         [workspace]\nmembers = [\"crates/beta\"]\n",
+    )
+    .expect("write workspace manifest");
+    fs::write(dir.join("src").join("lib.rs"), ALPHA_SOURCE).expect("write root source");
+    fs::write(beta.join("Cargo.toml"), manifest_member("beta")).expect("write member manifest");
+    fs::write(beta.join("src").join("lib.rs"), BETA_SOURCE).expect("write member source");
+    dir
+}
+
+/// A dependency-free manifest for a package that belongs to an enclosing
+/// workspace (so it declares no `[workspace]` of its own).
+fn manifest_member(package: &str) -> String {
+    format!("[package]\nname = \"{package}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n")
+}
+
+#[test]
+fn every_workspace_member_is_analysed_with_crate_qualified_modules() {
+    // C3/A3: members come from cargo metadata, not from walking the directory
+    // that happened to be passed, and the Module column carries the
+    // crate-qualified module name (FC-T6a) rather than S1's file path. The C14
+    // layout is unchanged — only the content of the Module column moved.
+    let dir = workspace_fixture("workspace_members");
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:src/lib.rs\nDA:2,0\nend_of_record\n\
+         SF:crates/beta/src/lib.rs\nDA:2,1\nend_of_record\n",
+    )
+    .expect("write workspace lcov");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        "\
+CRAP Report
+===========
+Function                       Module                                CC    Cov%     CRAP
+----------------------------------------------------------------------------------------
+alpha_one                      alpha                                  2    0.0%      6.0
+beta_one                       beta                                   1  100.0%      1.0
+"
+    );
+    // Both members' paths resolve exactly, so nothing is guessed.
+    assert_eq!(stderr_of(&out), "");
+}
+
+#[test]
+fn a_cross_member_path_collision_is_reported_as_ambiguous_not_guessed() {
+    // FC-T5a: the LCOV was produced under a different build root, so no key
+    // matches exactly. The root package's `src/lib.rs` is a segment-wise suffix
+    // of *both* members' keys, equally well — "first key wins" would have
+    // silently reported beta's coverage for alpha's function. Instead the tie
+    // is refused: alpha reports N/A (C13) and the warning names both
+    // candidates. beta's own path is longer and matches only one key, so it
+    // still resolves. Neither affects the exit code (C6).
+    let dir = workspace_fixture("workspace_collision");
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:/build/proj/src/lib.rs\nDA:2,0\nend_of_record\n\
+         SF:/build/proj/crates/beta/src/lib.rs\nDA:2,1\nend_of_record\n",
+    )
+    .expect("write relocated lcov");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        "\
+CRAP Report
+===========
+Function                       Module                                CC    Cov%     CRAP
+----------------------------------------------------------------------------------------
+beta_one                       beta                                   1  100.0%      1.0
+alpha_one                      alpha                                  2    N/A       N/A
+"
+    );
+
+    let stderr = stderr_of(&out);
+    let lines: Vec<&str> = stderr.lines().collect();
+    // One diagnostic per source file, in discovery (member-name) order.
+    assert_eq!(lines.len(), 2, "stderr: {stderr}");
+    assert!(lines[0].contains("src/lib.rs"), "stderr: {stderr}");
+    assert!(lines[0].contains("ambiguous"), "stderr: {stderr}");
+    // The tied candidates are named — an unqualified "ambiguous" is not
+    // actionable.
+    assert!(
+        lines[0].contains("/build/proj/src/lib.rs"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        lines[0].contains("/build/proj/crates/beta/src/lib.rs"),
+        "stderr: {stderr}"
+    );
+    assert!(lines[0].contains("N/A"), "stderr: {stderr}");
+    assert!(lines[1].contains("suffix match"), "stderr: {stderr}");
+    assert!(
+        lines[1].contains("/build/proj/crates/beta/src/lib.rs"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn one_lcov_record_claimed_by_two_members_is_a_collision_and_both_report_na() {
+    // Defect 3, the many-to-one case: the profile holds a *single* record and
+    // both members' `src/lib.rs` resolve to it — alpha's exactly, beta's by
+    // suffix. Each resolution is on its own unambiguous, so nothing local can
+    // see the clash; only the whole join can. An LCOV path is relative to a
+    // build root we do not know, so the record may describe either file: it is
+    // attributed to neither, both report N/A (C13), and the warning names the
+    // contested key and both claimants. Still not an error (C6).
+    let dir = workspace_fixture("workspace_many_to_one");
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:src/lib.rs\nDA:2,1\nend_of_record\n",
+    )
+    .expect("write single-record lcov");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        "\
+CRAP Report
+===========
+Function                       Module                                CC    Cov%     CRAP
+----------------------------------------------------------------------------------------
+alpha_one                      alpha                                  2    N/A       N/A
+beta_one                       beta                                   1    N/A       N/A
+"
+    );
+
+    let stderr = stderr_of(&out);
+    let lines: Vec<&str> = stderr.lines().collect();
+    // One diagnostic per affected source file, in discovery order.
+    assert_eq!(lines.len(), 2, "stderr: {stderr}");
+    for line in &lines {
+        // The contested record and *both* claimants, spelled out as a list so
+        // that neither claimant can be satisfied by the LCOV key alone: the
+        // many-to-one mapping is what has to be fixed, and neither line stands
+        // alone without it.
+        assert!(
+            line.contains("LCOV entry src/lib.rs is claimed by src/lib.rs, crates/beta/src/lib.rs"),
+            "stderr: {stderr}"
+        );
+        assert!(line.contains("N/A"), "stderr: {stderr}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T9 — multi-target packages: enumeration and naming come from cargo metadata's
+// `targets`, not from a `src/` walk.
+// ---------------------------------------------------------------------------
+
+/// A package holding three crates plus a member holding one, exercising every
+/// way a target can differ from a `<package>/src` walk: a bin under `src/bin`,
+/// an explicit `[[bin]] path` outside `src/` **with a sibling module**, a
+/// target name that is not the package name, a `#[path]`-relocated module, and
+/// two kinds of file no crate root reaches — one beside a library root, one in
+/// a package that has no library at all.
+fn multi_target_fixture(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = fs::remove_dir_all(&dir);
+    let solo = dir.join("crates").join("solo");
+    fs::create_dir_all(dir.join("src").join("bin")).expect("create root src/bin");
+    fs::create_dir_all(dir.join("cmd")).expect("create root cmd");
+    fs::create_dir_all(solo.join("cmd")).expect("create member cmd");
+    fs::create_dir_all(solo.join("src")).expect("create member src");
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+         [[bin]]\nname = \"renamed\"\npath = \"cmd/tool.rs\"\n\n\
+         [workspace]\nmembers = [\"crates/solo\"]\n",
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        dir.join("src").join("lib.rs"),
+        "#[path = \"aliased_file.rs\"]\nmod aliased;\n\nfn alpha_one() -> i32 {\n    1\n}\n",
+    )
+    .expect("write lib source");
+    // Reached only through `#[path]`: its module name follows the graph
+    // (`alpha::aliased`), not the file it happens to live in.
+    fs::write(
+        dir.join("src").join("aliased_file.rs"),
+        "fn aliased_one() -> i32 {\n    6\n}\n",
+    )
+    .expect("write aliased source");
+    // Beside a library root, and declared by nobody: cargo never compiles it.
+    fs::write(
+        dir.join("src").join("orphan.rs"),
+        "fn orphan_one() -> i32 {\n    7\n}\n",
+    )
+    .expect("write library-dir orphan");
+    fs::write(
+        dir.join("src").join("bin").join("tool.rs"),
+        "fn main() {}\n\nfn tool_one() -> i32 {\n    2\n}\n",
+    )
+    .expect("write src/bin source");
+    // A nonstandard crate root owns its own directory, so `cmd/helper.rs` is
+    // compiled product source of `renamed` and must be enumerated.
+    fs::write(
+        dir.join("cmd").join("tool.rs"),
+        "mod helper;\n\nfn main() {}\n\nfn renamed_one() -> i32 {\n    3\n}\n",
+    )
+    .expect("write explicit-bin source");
+    fs::write(
+        dir.join("cmd").join("helper.rs"),
+        "fn helper_one() -> i32 {\n    8\n}\n",
+    )
+    .expect("write sibling module source");
+
+    fs::write(
+        solo.join("Cargo.toml"),
+        "[package]\nname = \"solo\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+         [[bin]]\nname = \"solo-tool\"\npath = \"cmd/main.rs\"\n",
+    )
+    .expect("write member manifest");
+    fs::write(
+        solo.join("cmd").join("main.rs"),
+        "fn main() {}\n\nfn solo_one() -> i32 {\n    4\n}\n",
+    )
+    .expect("write member bin source");
+    // Belongs to no cargo target: `solo` has no lib, so nothing builds this.
+    fs::write(
+        solo.join("src").join("stray.rs"),
+        "fn stray_one() -> i32 {\n    5\n}\n",
+    )
+    .expect("write orphan source");
+    dir
+}
+
+#[test]
+fn every_target_is_enumerated_and_named_by_its_target_not_its_package() {
+    // Defect 1: `src/bin/tool.rs` is the root of crate `tool` (not
+    // `alpha::bin::tool`); an explicit `[[bin]] path` outside `src/` is a
+    // target like any other and must not be missed, and its sibling module is
+    // compiled source that must not be dropped either; a target name differing
+    // from its package name is what the module is qualified by (`solo_tool`,
+    // hyphen normalized); `#[path]` relocates a file without renaming its
+    // module; and a `.rs` file no crate root declares is not analysed at all —
+    // whether it sits beside a library root or in a package with no library.
+    //
+    // The whole report is asserted, not sampled: an exact match is the only
+    // way a file analysed *twice* — the cross-target and cross-package dedup
+    // failure — cannot slip through.
+    let dir = multi_target_fixture("multi_target");
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:src/lib.rs\nDA:5,1\nend_of_record\n\
+         SF:src/aliased_file.rs\nDA:2,1\nend_of_record\n\
+         SF:src/bin/tool.rs\nDA:4,1\nend_of_record\n\
+         SF:cmd/tool.rs\nDA:6,1\nend_of_record\n\
+         SF:cmd/helper.rs\nDA:2,1\nend_of_record\n\
+         SF:crates/solo/cmd/main.rs\nDA:4,1\nend_of_record\n",
+    )
+    .expect("write per-target lcov");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        "\
+CRAP Report
+===========
+Function                       Module                                CC    Cov%     CRAP
+----------------------------------------------------------------------------------------
+aliased_one                    alpha::aliased                         1  100.0%      1.0
+alpha_one                      alpha                                  1  100.0%      1.0
+helper_one                     renamed::helper                        1  100.0%      1.0
+main                           renamed                                1  100.0%      1.0
+main                           tool                                   1  100.0%      1.0
+main                           solo_tool                              1  100.0%      1.0
+renamed_one                    renamed                                1  100.0%      1.0
+solo_one                       solo_tool                              1  100.0%      1.0
+tool_one                       tool                                   1  100.0%      1.0
+"
+    );
+    // Every target's path resolves exactly, and every declared module was
+    // found, so nothing is guessed and nothing is warned about.
+    assert_eq!(stderr_of(&out), "");
+}
+
+/// Two packages naming the *same* file as a target root — which cargo permits,
+/// since a target's `path` may point outside its package.
+fn shared_source_fixture(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = fs::remove_dir_all(&dir);
+    let beta = dir.join("crates").join("beta");
+    fs::create_dir_all(dir.join("src")).expect("create root src");
+    fs::create_dir_all(dir.join("shared")).expect("create shared dir");
+    fs::create_dir_all(beta.join("src")).expect("create member src");
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+         [[bin]]\nname = \"alpha-shared\"\npath = \"shared/tool.rs\"\n\n\
+         [workspace]\nmembers = [\"crates/beta\"]\n",
+    )
+    .expect("write workspace manifest");
+    fs::write(dir.join("src").join("lib.rs"), ALPHA_SOURCE).expect("write root source");
+    fs::write(
+        dir.join("shared").join("tool.rs"),
+        "fn main() {}\n\nfn shared_one() -> i32 {\n    9\n}\n",
+    )
+    .expect("write shared source");
+
+    fs::write(
+        beta.join("Cargo.toml"),
+        "[package]\nname = \"beta\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+         [[bin]]\nname = \"beta-shared\"\npath = \"../../shared/tool.rs\"\n",
+    )
+    .expect("write member manifest");
+    fs::write(beta.join("src").join("lib.rs"), BETA_SOURCE).expect("write member source");
+    dir
+}
+
+#[test]
+fn a_source_named_by_two_packages_is_analysed_exactly_once() {
+    // Defect 3: dedup has to span the whole workspace, not one package's
+    // targets, and it has to see through two different spellings of one file
+    // (`shared/tool.rs` and `crates/beta/../../shared/tool.rs`). Analysed
+    // twice, `shared_one` would be counted twice in every aggregate and
+    // reported twice under two crate names.
+    let dir = shared_source_fixture("shared_source");
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:src/lib.rs\nDA:2,1\nend_of_record\n\
+         SF:crates/beta/src/lib.rs\nDA:2,1\nend_of_record\n\
+         SF:shared/tool.rs\nDA:4,1\nend_of_record\n",
+    )
+    .expect("write lcov");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    // The first claimant in the deterministic order — package `alpha`, whose
+    // bin target sorts before `beta`'s — owns and names the file.
+    assert_eq!(
+        stdout_of(&out),
+        "\
+CRAP Report
+===========
+Function                       Module                                CC    Cov%     CRAP
+----------------------------------------------------------------------------------------
+alpha_one                      alpha                                  2  100.0%      2.0
+beta_one                       beta                                   1  100.0%      1.0
+main                           alpha_shared                           1  100.0%      1.0
+shared_one                     alpha_shared                           1  100.0%      1.0
+"
+    );
+    assert_eq!(stderr_of(&out), "");
+}
+
+#[test]
+fn a_declared_module_with_no_file_warns_and_still_exits_zero() {
+    // A `mod` declaration that resolves to nothing is a real condition — the
+    // crate does not compile as written, or the module is behind a cfg we do
+    // not evaluate (T10). Either way it is *said*, naming both places rustc
+    // would have looked, and the rest of the report is produced normally (C6).
+    let dir = fixture("missing_module");
+    fs::write(
+        dir.join("src").join("lib.rs"),
+        format!("mod absent;\n\n{SOURCE}"),
+    )
+    .expect("write source declaring a missing module");
+    fs::write(
+        dir.join("coverage.lcov"),
+        LCOV.replace("DA:2,3", "DA:4,3").replace("DA:6,", "DA:8,"),
+    )
+    .expect("write shifted lcov");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("covered"), "{stdout}");
+    assert!(stdout.contains("risky"), "{stdout}");
+
+    let stderr = stderr_of(&out);
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), 1, "stderr: {stderr}");
+    assert!(lines[0].contains("src/lib.rs"), "stderr: {stderr}");
+    assert!(lines[0].contains("demo::absent"), "stderr: {stderr}");
+    assert!(lines[0].contains("src/absent.rs"), "stderr: {stderr}");
+    assert!(lines[0].contains("src/absent/mod.rs"), "stderr: {stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// T9 — FC-T7a: the path identity is relative, always.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_source_outside_the_workspace_root_is_reported_by_a_relative_path() {
+    // FC-T7a (defect 2): a target rooted outside the workspace root — here an
+    // explicit `[[bin]] path` above it, the shape a path-dependency layout also
+    // produces — must still be known by a *relative* path. An absolute path — a
+    // drive letter on Windows, a build-machine path anywhere — must never reach
+    // the identity the join queries by and the report carries.
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join("external_source");
+    let _ = fs::remove_dir_all(&base);
+    let root = base.join("workspace");
+    fs::create_dir_all(root.join("src")).expect("create root src");
+    fs::create_dir_all(base.join("shared")).expect("create external dir");
+
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+         [[bin]]\nname = \"shared\"\npath = \"../shared/tool.rs\"\n\n\
+         [workspace]\n",
+    )
+    .expect("write workspace manifest");
+    fs::write(root.join("src").join("lib.rs"), ALPHA_SOURCE).expect("write root source");
+    fs::write(
+        base.join("shared").join("tool.rs"),
+        "fn main() {}\n\nfn shared_one() -> i32 {\n    2\n}\n",
+    )
+    .expect("write external source");
+    // Only the root package is in the profile, so the outside-the-root file's
+    // path is named on stderr — which is where its identity becomes observable.
+    fs::write(
+        root.join("coverage.lcov"),
+        "SF:src/lib.rs\nDA:2,1\nend_of_record\n",
+    )
+    .expect("write lcov");
+
+    let out = run_in(&root, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    // It is analysed, under its own target's name.
+    assert!(
+        stdout_of(&out).contains("shared_one"),
+        "{}",
+        stdout_of(&out)
+    );
+
+    let stderr = stderr_of(&out);
+    let external_line = stderr
+        .lines()
+        .find(|line| line.contains("tool.rs"))
+        .unwrap_or_else(|| panic!("external source not diagnosed; stderr:\n{stderr}"));
+    assert!(
+        external_line.contains("../shared/tool.rs"),
+        "stderr: {stderr}"
+    );
+    // No absolute path and no Windows drive letter in the identity.
+    assert!(
+        !external_line.contains(":\\") && !external_line.contains(":/"),
+        "an absolute path leaked: {external_line}"
+    );
+    assert!(
+        !external_line.contains(" /"),
+        "an absolute path leaked: {external_line}"
+    );
 }
