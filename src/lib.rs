@@ -12,6 +12,7 @@ mod crap;
 mod diagnostic;
 mod filter;
 mod join;
+mod json;
 mod product;
 mod report;
 mod runner;

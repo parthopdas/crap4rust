@@ -61,6 +61,17 @@ impl Filters {
         self.0.is_empty()
     }
 
+    /// The fragments as the user spelled them, in the order given.
+    ///
+    /// This is C28's request echo: the JSON document states the *effective
+    /// request* so a consumer can tell "no risk was found" from "you narrowed
+    /// the report". Spelled, not normalized — the echo answers "what did I
+    /// ask for?", and `crates\alpha` is what was asked for even though
+    /// `crates/alpha` is what was matched.
+    pub(crate) fn fragments(&self) -> Vec<&str> {
+        self.0.iter().map(|f| f.text.as_str()).collect()
+    }
+
     /// What the filters have to say about `path`, as a value.
     ///
     /// With no filters everything is selected. Otherwise a file needs one

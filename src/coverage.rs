@@ -296,8 +296,10 @@ fn segments(path: &str) -> Vec<&str> {
 /// suffix of the profile key, never the reverse. We match both ways on purpose:
 /// LCOV `SF:` keys are typically short and repo-relative while the CC engine
 /// reports absolute paths, so the one-directional rule would fail to resolve
-/// and report `N/A` for essentially every function. Upstream also takes the
-/// first match; we take the longest and refuse to guess on a tie.
+/// and report `N/A` for essentially every function. Upstream's `segmentsForFile`
+/// also stops at the first matching candidate while ranging over a Go map — an
+/// *arbitrary* one when several match, since that iteration order is randomized;
+/// we take the longest and refuse to guess on a tie.
 fn suffix_overlap(a: &[&str], b: &[&str]) -> Option<usize> {
     let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     (!short.is_empty() && long.ends_with(short)).then_some(short.len())

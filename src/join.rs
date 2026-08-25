@@ -16,7 +16,7 @@
 //!    documented divergence — see [`LcovData::resolve_path`]), and keep the
 //!    file-absent vs file-present distinction all the way to the join contract.
 //!    The *exactness* of each match is carried out as data
-//!    ([`JoinResult::attributions`]) so the CLI can emit a stderr diagnostic
+//!    ([`JoinedFile::attribution`]) so the CLI can emit a stderr diagnostic
 //!    (FC-T5b) — this module never prints.
 //!    Resolution is decided over the **whole join**, not per file in isolation:
 //!    see [`Attribution`] for why one LCOV record may never be attributed to
@@ -56,10 +56,52 @@ pub(crate) struct JoinedFunction {
     pub(crate) complexity: u32,
     /// Coverage fraction in `[0.0, 1.0]`, or `None` when the file is absent
     /// from the LCOV profile (N/A, unscored). Never NaN or out of range.
+    ///
+    /// Derived from [`lines`](Self::lines) and nowhere else, so the ratio and
+    /// the counts a consumer sees can never disagree (FC-T10e).
     pub(crate) coverage: Option<f64>,
+    /// The instrumented-line counts [`coverage`](Self::coverage) was computed
+    /// from, or `None` exactly when `coverage` is `None`.
+    ///
+    /// Carried because the fraction alone is lossy: `total == 0 ⇒ 1.0` (C13)
+    /// is invisible in it, and per-function ratios cannot be aggregated
+    /// without their weights.
+    pub(crate) lines: Option<LineCounts>,
     /// CRAP score = `crap::score(complexity, coverage)`; `None` mirrors an
     /// absent coverage.
     pub(crate) crap: Option<f64>,
+}
+
+/// The instrumented lines under one function's range, as LCOV reports them.
+///
+/// The single source of the C13 numbers: [`fraction`](Self::fraction) is the
+/// only place a coverage ratio is computed, so the ratio and the counts always
+/// describe the same lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LineCounts {
+    /// Instrumented lines in the range that were hit at least once.
+    pub(crate) covered: u64,
+    /// Instrumented lines in the range. Zero means the file is in the profile
+    /// but nothing under this function was instrumented (C13).
+    pub(crate) total: u64,
+}
+
+impl LineCounts {
+    /// The C13 fraction: `total == 0 ⇒ 1.0` (nothing instrumented is nothing
+    /// untested — the deliberate divergence from crap4go), else
+    /// `covered / total`. Never NaN, always in `[0.0, 1.0]`, because
+    /// `covered ≤ total` by construction in [`LcovData::coverage_in_range`]
+    /// and the zero branch short-circuits before any division (FC-T4b).
+    ///
+    /// The **only** place a coverage ratio is computed; the reporters read the
+    /// result rather than dividing again (FC-T10e).
+    pub(crate) fn fraction(self) -> f64 {
+        if self.total == 0 {
+            1.0
+        } else {
+            self.covered as f64 / self.total as f64
+        }
+    }
 }
 
 /// One analysed source file: the functions the CC engine found in it, plus the
@@ -112,6 +154,13 @@ pub(crate) enum Attribution<'a> {
         /// The contested LCOV key.
         key: &'a str,
         /// Every source path claiming it, in join input order.
+        ///
+        /// **Not referentially closed** (FC-T10c). These are C15 identities —
+        /// byte-identical to the `file` the rows of those source files carry
+        /// (FC-T9o) — but attribution is settled over the **whole workspace**
+        /// (C26), so under `--filter` a named claimant may have no row in the
+        /// report at all. A consumer must treat the reference as a path, not
+        /// as a foreign key it can always resolve.
         sources: Vec<String>,
     },
     /// This file claimed a record by suffix match and lost it to the single
@@ -121,8 +170,64 @@ pub(crate) enum Attribution<'a> {
         /// The contested LCOV key.
         key: &'a str,
         /// The source path that matched `key` exactly and therefore owns it.
+        ///
+        /// **Not referentially closed** (FC-T10c): the same caveat as
+        /// [`Attribution::Collision::sources`] — a byte-identical C15 identity (FC-T9o)
+        /// that, under `--filter`, may name a file with no row in the report.
         winner: String,
     },
+}
+
+/// What a file's [`Attribution`] means for **every row scored from it**
+/// (FC-T9b\*) — five states, plus a silent sixth.
+///
+/// Three states would not do. `coverage: null` cannot tell *absent from the
+/// profile* from *ambiguous* from *contested*, which are three different user
+/// actions; and a [`Suffix`](Self::Suffix) row is not null at all — it is
+/// **scored, possibly from another file's numbers**, which is the more
+/// dangerous state precisely because it looks like an answer. An exact match
+/// is the silent state: it is [`Attribution::caveat`]'s `None`, so "nothing to
+/// say" has one representation rather than a sixth tag nobody branches on.
+///
+/// Borrowed, never rebuilt: the particulars come straight out of the
+/// attribution that produced them, so the stderr renderer and the JSON
+/// reporter read the same values from the same place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Caveat<'a> {
+    /// Scored — but from a record matched only by path *suffix*, so the
+    /// numbers may describe a different file.
+    Suffix { key: &'a str },
+    /// The file is not in the coverage profile at all; its rows are `N/A`.
+    Absent,
+    /// Several profile records match the file equally well (FC-T5a); its rows
+    /// are `N/A`.
+    Ambiguous { keys: &'a [&'a str] },
+    /// The file's record is claimed by several source files and nothing ranks
+    /// the claims (C19); its rows are `N/A`.
+    Contested {
+        key: &'a str,
+        claimants: &'a [String],
+    },
+    /// The file's claim lost to a claimant that matched the record exactly
+    /// (C19); its rows are `N/A`.
+    Superseded { key: &'a str, winner: &'a str },
+}
+
+impl Caveat<'_> {
+    /// The stable wire tag for this state.
+    ///
+    /// **Append-only and never renamed**, on the same terms as a diagnostic
+    /// `code` (C24): it is emitted in the frozen JSON document, where a rename
+    /// is a breaking change for every consumer branching on it.
+    pub(crate) fn tag(&self) -> &'static str {
+        match self {
+            Self::Suffix { .. } => "suffix",
+            Self::Absent => "absent",
+            Self::Ambiguous { .. } => "ambiguous",
+            Self::Contested { .. } => "contested",
+            Self::Superseded { .. } => "superseded",
+        }
+    }
 }
 
 impl<'a> Attribution<'a> {
@@ -135,17 +240,56 @@ impl<'a> Attribution<'a> {
             Self::Collision { .. } | Self::Superseded { .. } => None,
         }
     }
+
+    /// **The** per-row caveat classifier (FC-T9b\*): `None` for an exact match
+    /// — the silent state — and otherwise the one [`Caveat`] that describes
+    /// every row scored from this file.
+    ///
+    /// There is exactly one of these because there are two consumers: the
+    /// stderr renderer turns it into a [`crate::diagnostic::Diagnostic`], and
+    /// the JSON reporter
+    /// emits its [`tag`](Caveat::tag) on each row. Two matches over
+    /// [`Attribution`] would be two chances to disagree about whether a file
+    /// is contested — and the row would then say one thing while the warning
+    /// beside it said another.
+    pub(crate) fn caveat(&self) -> Option<Caveat<'_>> {
+        match self {
+            Self::Resolved(Resolution::Exact(_)) => None,
+            Self::Resolved(Resolution::Suffix(key)) => Some(Caveat::Suffix { key }),
+            Self::Resolved(Resolution::Ambiguous(keys)) => Some(Caveat::Ambiguous { keys }),
+            Self::Resolved(Resolution::Unresolved) => Some(Caveat::Absent),
+            Self::Collision { key, sources } => Some(Caveat::Contested {
+                key,
+                claimants: sources,
+            }),
+            Self::Superseded { key, winner } => Some(Caveat::Superseded { key, winner }),
+        }
+    }
 }
 
-/// The join's output: the per-function results plus the per-file attributions
-/// that produced them.
-pub(crate) struct JoinResult<'a> {
-    /// One entry per input function, in input order.
+/// One joined source file: what its coverage was attributed to, and the
+/// functions that attribution scored.
+///
+/// The functions sit **under** their attribution rather than beside it
+/// (FC-T9b\*). A row's coverage caveat and the row itself must never be
+/// reassociated by path string after the fact: two parallel vectors keyed by a
+/// path string is exactly the re-join that would put one file's caveat on
+/// another file's rows the first time a path is normalized differently at one
+/// of the two ends.
+pub(crate) struct JoinedFile<'a> {
+    /// The path this file is known by — the C15 identity its rows carry.
+    pub(crate) file: String,
+    /// What this file's coverage was finally attributed to, over the whole
+    /// join (FC-T5b).
+    pub(crate) attribution: Attribution<'a>,
+    /// The functions scored from that attribution, in input order.
     pub(crate) functions: Vec<JoinedFunction>,
-    /// One entry per input file, in input order: the path as given, and what
-    /// its coverage was attributed to (FC-T5b). Borrowed keys point into the
-    /// [`LcovData`] the join was run against.
-    pub(crate) attributions: Vec<(String, Attribution<'a>)>,
+}
+
+/// The join's output: one entry per input file, in input order, each carrying
+/// the functions it produced (see [`JoinedFile`]).
+pub(crate) struct JoinResult<'a> {
+    pub(crate) files: Vec<JoinedFile<'a>>,
 }
 
 /// Join per-file CC results against `lcov`, producing one [`JoinedFunction`]
@@ -191,8 +335,7 @@ pub(crate) fn join<'a>(lcov: &'a LcovData, units: &[SourceUnit]) -> JoinResult<'
 
     // 3. Score, skipping every file whose record another file has a better — or
     //    an equally good — claim on.
-    let mut functions = Vec::new();
-    let mut attributions = Vec::new();
+    let mut files = Vec::new();
     for (unit, resolution) in units.iter().zip(resolved) {
         let attribution = match resolution.key().map(|key| (key, &claims[key])) {
             Some((key, claimants)) if claimants.len() > 1 => {
@@ -201,8 +344,10 @@ pub(crate) fn join<'a>(lcov: &'a LcovData, units: &[SourceUnit]) -> JoinResult<'
             _ => Attribution::Resolved(resolution),
         };
         let key = attribution.key();
+        let mut functions = Vec::new();
         for fc in &unit.functions {
-            let coverage = coverage_for(lcov, key, fc);
+            let lines = line_counts(lcov, key, fc);
+            let coverage = lines.map(LineCounts::fraction);
             let crap = crap::score(fc.complexity, coverage);
             functions.push(JoinedFunction {
                 name: fc.name.clone(),
@@ -211,15 +356,17 @@ pub(crate) fn join<'a>(lcov: &'a LcovData, units: &[SourceUnit]) -> JoinResult<'
                 start_line: fc.start_line,
                 complexity: fc.complexity,
                 coverage,
+                lines,
                 crap,
             });
         }
-        attributions.push((unit.path.clone(), attribution));
+        files.push(JoinedFile {
+            file: unit.path.clone(),
+            attribution,
+            functions,
+        });
     }
-    JoinResult {
-        functions,
-        attributions,
-    }
+    JoinResult { files }
 }
 
 /// One source file's claim on an LCOV record, with the evidence behind it.
@@ -300,21 +447,17 @@ fn module_of(unit: &SourceUnit, fc: &FunctionComplexity) -> String {
 
 /// Apply the C13 contract for one function given its file's attributed LCOV key.
 ///
-/// The returned `Some` fraction is always in `[0.0, 1.0]` and never NaN:
-/// `covered ≤ total` by construction in [`LcovData::coverage_in_range`], and
-/// the `total == 0` branch short-circuits before any division (FC-T4b).
-fn coverage_for(lcov: &LcovData, key: Option<&str>, fc: &FunctionComplexity) -> Option<f64> {
+/// Returns the counts, never a ratio: the ratio is [`LineCounts::fraction`],
+/// computed once by the caller, so no second computation of coverage exists to
+/// drift from this one (FC-T10e).
+fn line_counts(lcov: &LcovData, key: Option<&str>, fc: &FunctionComplexity) -> Option<LineCounts> {
     // No defensible key (file absent, an ambiguous tie, or a record contested
-    // by another source file) ⇒ None: N/A, unscored.
+    // by another source file) ⇒ None: N/A, unscored, and no counts either —
+    // nothing was counted, which is not the same fact as counting zero lines.
     let key = key?;
     let (covered, total) =
         lcov.coverage_in_range(key, line_to_u32(fc.start_line), line_to_u32(fc.end_line));
-    if total == 0 {
-        // C13 divergence from crap4go: no instrumented lines ⇒ nothing to test.
-        Some(1.0)
-    } else {
-        Some(covered as f64 / total as f64)
-    }
+    Some(LineCounts { covered, total })
 }
 
 /// Consciously narrow a 1-based `usize` source line to the `u32` that
@@ -363,9 +506,33 @@ end_of_record
         }
     }
 
+    /// Every joined function, files in input order — the flattened view the
+    /// reporters see. The join groups functions under the file whose
+    /// attribution scored them (FC-T9b\*), so the flat list is a projection.
+    fn functions<'a>(result: &'a JoinResult<'_>) -> Vec<&'a JoinedFunction> {
+        result
+            .files
+            .iter()
+            .flat_map(|file| file.functions.iter())
+            .collect()
+    }
+
+    /// The `(file, attribution)` pairs, in input order.
+    fn attributions<'a>(result: &JoinResult<'a>) -> Vec<(String, Attribution<'a>)> {
+        result
+            .files
+            .iter()
+            .map(|file| (file.file.clone(), file.attribution.clone()))
+            .collect()
+    }
+
     fn join_one(file: &str, fc: FunctionComplexity) -> JoinedFunction {
         let lcov = parse_lcov(FIXTURE).expect("valid fixture");
-        let mut out = join(&lcov, &[unit(file, vec![fc])]).functions;
+        let mut out: Vec<JoinedFunction> = join(&lcov, &[unit(file, vec![fc])])
+            .files
+            .into_iter()
+            .flat_map(|file| file.functions)
+            .collect();
         assert_eq!(out.len(), 1);
         out.pop().unwrap()
     }
@@ -418,10 +585,10 @@ end_of_record
         let units = vec![unit("../shared/tool.rs", vec![fc("f", 1, 10, 10)])];
         let result = join(&lcov, &units);
 
-        assert_eq!(result.functions[0].coverage, Some(1.0));
+        assert_eq!(functions(&result)[0].coverage, Some(1.0));
         // The identity it is reported and diagnosed by is unchanged.
-        assert_eq!(result.functions[0].file, "../shared/tool.rs");
-        assert_eq!(result.attributions[0].0, "../shared/tool.rs");
+        assert_eq!(functions(&result)[0].file, "../shared/tool.rs");
+        assert_eq!(attributions(&result)[0].0, "../shared/tool.rs");
     }
 
     /// The two path jobs meet: `--filter` matches the **display identity**
@@ -459,7 +626,8 @@ end_of_record
             path: "crates/alpha/src/foo.rs".to_string(),
             functions: vec![fc("f", 1, 10, 13)],
         }];
-        let joined = join(&lcov, &units).functions;
+        let result = join(&lcov, &units);
+        let joined = functions(&result);
         assert_eq!(joined[0].module, "alpha::foo");
         assert_eq!(joined[0].file, "crates/alpha/src/foo.rs");
     }
@@ -475,10 +643,10 @@ end_of_record
         .expect("valid fixture");
         let result = join(&lcov, &[unit("src/lib.rs", vec![fc("f", 3, 10, 13)])]);
 
-        assert_eq!(result.functions[0].coverage, None);
-        assert_eq!(result.functions[0].crap, None);
+        assert_eq!(functions(&result)[0].coverage, None);
+        assert_eq!(functions(&result)[0].crap, None);
         assert_eq!(
-            result.attributions,
+            attributions(&result),
             vec![(
                 "src/lib.rs".to_string(),
                 Attribution::Resolved(Resolution::Ambiguous(vec![
@@ -511,7 +679,7 @@ end_of_record
         ];
         let result = join(&lcov, &units);
 
-        for joined in &result.functions {
+        for joined in functions(&result) {
             assert_eq!(joined.coverage, None, "{} was scored", joined.name);
             assert_eq!(joined.crap, None, "{} was scored", joined.name);
         }
@@ -520,7 +688,7 @@ end_of_record
             "crates/beta/src/lib.rs".to_string(),
         ];
         assert_eq!(
-            result.attributions,
+            attributions(&result),
             vec![
                 (
                     "crates/alpha/src/lib.rs".to_string(),
@@ -563,11 +731,11 @@ end_of_record
         ];
         let result = join(&lcov, &units);
 
-        assert_eq!(result.functions[0].coverage, Some(1.0));
-        assert_eq!(result.functions[1].coverage, None);
-        assert_eq!(result.functions[1].crap, None);
+        assert_eq!(functions(&result)[0].coverage, Some(1.0));
+        assert_eq!(functions(&result)[1].coverage, None);
+        assert_eq!(functions(&result)[1].crap, None);
         assert_eq!(
-            result.attributions,
+            attributions(&result),
             vec![
                 (
                     "src/lib.rs".to_string(),
@@ -605,12 +773,12 @@ end_of_record
         ];
         let result = join(&lcov, &units);
 
-        for joined in &result.functions {
+        for joined in functions(&result) {
             assert_eq!(joined.coverage, None, "{} was scored", joined.name);
         }
         let sources = vec!["src/lib.rs".to_string(), "./src/lib.rs".to_string()];
         assert_eq!(
-            result.attributions,
+            attributions(&result),
             vec![
                 (
                     "src/lib.rs".to_string(),
@@ -648,7 +816,8 @@ end_of_record
                 },
             ],
         }];
-        let joined = join(&lcov, &units).functions;
+        let result = join(&lcov, &units);
+        let joined = functions(&result);
 
         assert_eq!(joined[0].module, "demo::foo");
         assert_eq!(joined[0].name, "top");
@@ -681,8 +850,8 @@ end_of_record
 
         // Each member's longest overlap is its own key, so no record is
         // contested and both suffix matches are still scored.
-        assert_eq!(result.functions[0].coverage, Some(1.0));
-        assert_eq!(result.functions[1].coverage, Some(0.0));
+        assert_eq!(functions(&result)[0].coverage, Some(1.0));
+        assert_eq!(functions(&result)[1].coverage, Some(0.0));
     }
 
     #[test]
@@ -692,6 +861,40 @@ end_of_record
         let j = join_one("src/lib.rs", fc("no_da", 9, 100, 110));
         assert_eq!(j.coverage, Some(1.0));
         assert_eq!(j.crap, crap::score(9, Some(1.0)));
+        // The counts are what makes that `1.0` readable downstream: nothing was
+        // instrumented, so nothing was untested.
+        assert_eq!(
+            j.lines,
+            Some(LineCounts {
+                covered: 0,
+                total: 0
+            })
+        );
+    }
+
+    /// The counts and the ratio are the same numbers — the ratio *is* the
+    /// counts, divided once (FC-T10e). Two of four lines hit, and both facts
+    /// agree because only one of them was ever computed.
+    #[test]
+    fn the_counts_are_the_numbers_the_fraction_came_from() {
+        let j = join_one("src/lib.rs", fc("partial", 2, 10, 13));
+        assert_eq!(
+            j.lines,
+            Some(LineCounts {
+                covered: 2,
+                total: 4
+            })
+        );
+        assert_eq!(j.coverage, Some(j.lines.unwrap().fraction()));
+    }
+
+    /// File absent ⇒ no ratio *and* no counts: nothing was counted, which is
+    /// not the same fact as having counted zero instrumented lines.
+    #[test]
+    fn an_unattributed_file_has_no_counts_either() {
+        let j = join_one("src/other.rs", fc("absent", 7, 10, 13));
+        assert_eq!(j.coverage, None);
+        assert_eq!(j.lines, None);
     }
 
     #[test]
@@ -721,7 +924,7 @@ end_of_record
                 fc("no_da", 9, 100, 110),
             ],
         )];
-        for j in join(&lcov, &files).functions {
+        for j in functions(&join(&lcov, &files)) {
             if let Some(cov) = j.coverage {
                 assert!((0.0..=1.0).contains(&cov), "cov {cov} out of [0,1]");
                 assert!(!cov.is_nan(), "cov is NaN");
@@ -745,7 +948,7 @@ end_of_record
         let result = join(&lcov, &files);
 
         assert_eq!(
-            result.attributions,
+            attributions(&result),
             vec![
                 (
                     "src/lib.rs".to_string(),
@@ -762,7 +965,7 @@ end_of_record
             ]
         );
         // The two functions in the first file yield a single attribution entry.
-        assert_eq!(result.functions.len(), 4);
+        assert_eq!(functions(&result).len(), 4);
     }
 
     /// End-to-end span seam: real `syn` spans from the CC engine flow through
@@ -830,7 +1033,8 @@ DA:11,0
 end_of_record
 ";
         let lcov = parse_lcov(LCOV).expect("valid fixture");
-        let joined = join(&lcov, &[unit("src/demo.rs", fns.clone())]).functions;
+        let result = join(&lcov, &[unit("src/demo.rs", fns.clone())]);
+        let joined = functions(&result);
 
         let jf = |name: &str| {
             joined

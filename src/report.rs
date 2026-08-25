@@ -35,13 +35,18 @@ pub(crate) struct ReportRow {
     /// Crate-qualified module display string (`Module` column, C3). Supplied by
     /// the caller; the reporter never derives crate identity itself.
     pub(crate) module: String,
-    /// Source file path — **not** rendered by C14's table. Carried for the
-    /// stable identity key (C15) the JSON contract needs (T11).
-    #[allow(dead_code)]
+    /// Source file path — **not** rendered by C14's table. Half of the stable
+    /// identity key (C15), read here only as the last-resort tiebreak that
+    /// makes [`order_by_crap`] a *total* order.
+    ///
+    /// C14-display-only, and a **candidate for deletion**: [`ReportRow`] is the
+    /// five-column display projection, and the JSON reporter already reads C15
+    /// identity from [`JoinedFunction`] (it needs the file's attribution too,
+    /// which a row structurally cannot carry). Deleting it means ordering the
+    /// table over [`JoinedFunction`] as well — carried to T13 (FC-T11e).
     pub(crate) file: String,
     /// 1-based start line — **not** rendered by C14's table. Second half of the
-    /// C15 identity key; read by the JSON reporter (T11).
-    #[allow(dead_code)]
+    /// C15 identity key; same standing as [`file`](Self::file).
     pub(crate) start_line: usize,
     /// Cyclomatic complexity (`CC` column).
     pub(crate) complexity: u32,
@@ -69,8 +74,7 @@ pub(crate) fn rows_from_joined(fns: &[JoinedFunction]) -> Vec<ReportRow> {
         .collect()
 }
 
-/// Render the full report per C14, sorted by CRAP descending (`None` last,
-/// ties broken by name ascending).
+/// Render the full report per C14, in [`order_by_crap`]'s total order.
 ///
 /// Returns the whole report as a `String`, every line newline-terminated. The
 /// input is borrowed and never mutated; sorting happens on a local index.
@@ -88,8 +92,8 @@ pub(crate) fn format_report(rows: &[ReportRow]) -> String {
     out.push('\n');
 
     let mut ordered: Vec<&ReportRow> = rows.iter().collect();
-    // `sort_by` is stable, so equal keys keep input order; the name tie-break
-    // makes the result deterministic regardless.
+    // The comparator is total (see `order_by_crap`), so the result does not
+    // depend on the sort being stable — or on the input order.
     ordered.sort_by(|a, b| compare(a, b));
 
     for row in ordered {
@@ -105,8 +109,71 @@ pub(crate) fn format_report(rows: &[ReportRow]) -> String {
     out
 }
 
-/// C14 ordering: CRAP descending, `None` last, ties broken by name ascending.
+/// C14 ordering: see [`order_by_crap`].
 fn compare(a: &ReportRow, b: &ReportRow) -> Ordering {
+    order_by_crap(
+        OrderKey {
+            crap: a.crap,
+            name: &a.name,
+            file: &a.file,
+            start_line: a.start_line,
+        },
+        OrderKey {
+            crap: b.crap,
+            name: &b.name,
+            file: &b.file,
+            start_line: b.start_line,
+        },
+    )
+}
+
+/// Everything the report's ordering keys on, named rather than positional:
+/// `name` and `file` are both `&str`, and a silent swap of the two would only
+/// show up as a reordering of the frozen JSON contract.
+pub(crate) struct OrderKey<'a> {
+    pub(crate) crap: Option<f64>,
+    pub(crate) name: &'a str,
+    pub(crate) file: &'a str,
+    pub(crate) start_line: usize,
+}
+
+/// The report's ordering (FC-T6d/FC-T9q): **CRAP descending, `None` last, then
+/// `name` ascending, then `file` ascending, then `start_line` ascending.**
+///
+/// Hoisted out of [`compare`] so the JSON reporter orders its `functions[]` by
+/// **this** definition rather than a copy of it: a second implementation would
+/// let the two reporters disagree about the order of the same run, and in JSON
+/// the order is part of a frozen contract.
+///
+/// **Total, deliberately.** `(crap, name)` alone is partial — rows agreeing on
+/// both fell through to whatever order the caller happened to pass, which is
+/// the module graph's BFS order, i.e. exactly the traversal detail FC-T9q
+/// exists to keep out of the contract, hiding at the bottom of the tiebreak
+/// chain. `file` + `start_line` is the C15 identity and therefore unique, so
+/// the chain always terminates in a decision and the result no longer depends
+/// on the sort algorithm being stable — a property an unstable parallel sort
+/// would otherwise quietly destroy.
+///
+/// **C36 — a deliberate divergence from crap4go, in the same register as C16.**
+/// Upstream's tie order is *not* arbitrary. At `unclebob/crap4go` @ `bee16db`,
+/// `SortByCRAP` (`internal/crap/crap.go`) uses `sort.SliceStable`, and its
+/// comparator returns `*a > *b` for two **scored** entries — `false` in both
+/// directions when the scores are equal — so equal-CRAP rows keep their input
+/// order, which `cmd/crap4go/main.go` fixes as `findSourceFiles`' `sort.Strings`
+/// file order, then declaration order within each file. `Name` is consulted
+/// **only** when both entries' CRAP is `nil`. Upstream's order is therefore
+/// stable and knowable.
+///
+/// We have diverged from it since **T6**: our comparator breaks *scored* ties on
+/// `name`, which upstream never consults for scored rows, and that divergence is
+/// locked by an existing C14 test. Adding `file` and `start_line` does not
+/// introduce it — it refines what **our own** comparator left undefined *below*
+/// the pre-existing `name` tiebreak, replacing "whatever order the caller
+/// passed" (module-graph BFS) with C15 identity. The result is strictly more
+/// deterministic than both our previous behaviour and upstream's, and it no
+/// longer depends on the sort being stable — which is what lets an unstable
+/// parallel sort be used here safely.
+pub(crate) fn order_by_crap(a: OrderKey<'_>, b: OrderKey<'_>) -> Ordering {
     let by_crap = match (a.crap, b.crap) {
         // `total_cmp` gives a total order without `partial_cmp` + unwrap.
         (Some(x), Some(y)) => y.total_cmp(&x),
@@ -114,7 +181,10 @@ fn compare(a: &ReportRow, b: &ReportRow) -> Ordering {
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
     };
-    by_crap.then_with(|| a.name.cmp(&b.name))
+    by_crap
+        .then_with(|| a.name.cmp(b.name))
+        .then_with(|| a.file.cmp(b.file))
+        .then_with(|| a.start_line.cmp(&b.start_line))
 }
 
 /// The single column layout of C14 — Go `%-30s %-35s %4s %7s %8s`.
@@ -247,6 +317,43 @@ zulu                           src/a.rs                               2    N/A  
         assert_eq!(format_report(&rows), expected);
     }
 
+    /// **Locked (C14/C36) — do not "fix" this test.** It exercises the *full*
+    /// ordering key: three rows with identical CRAP **and** identical `name`,
+    /// separable only by `file` then `start_line`, fed in deliberately wrong
+    /// input order. None of the other locked `report.rs` tests contains two rows
+    /// sharing both CRAP and name, so none of them can catch a regression below
+    /// the `name` tiebreak — this one exists to close that hole. It must keep
+    /// passing unchanged when the reporter moves to an unstable parallel sort
+    /// (T12): that is precisely the property it pins.
+    #[test]
+    fn equal_crap_and_name_break_by_file_then_start_line() {
+        fn keyed_row(module: &str, file: &str, start_line: usize) -> ReportRow {
+            ReportRow {
+                name: "dup".to_string(),
+                module: module.to_string(),
+                file: file.to_string(),
+                start_line,
+                complexity: 2,
+                coverage: Some(0.5),
+                crap: crate::crap::score(2, Some(0.5)),
+            }
+        }
+
+        let rows = vec![
+            keyed_row("crate::c", "src/b.rs", 1),
+            keyed_row("crate::a", "src/a.rs", 30),
+            keyed_row("crate::b", "src/a.rs", 10),
+        ];
+        let expected = format!(
+            "{PREAMBLE}\
+dup                            crate::b                               2   50.0%      2.5
+dup                            crate::a                               2   50.0%      2.5
+dup                            crate::c                               2   50.0%      2.5
+"
+        );
+        assert_eq!(format_report(&rows), expected);
+    }
+
     #[test]
     fn long_cells_overflow_and_do_not_truncate() {
         // Go's `%-30s`/`%-35s` never truncate; they overflow and push the rest
@@ -274,6 +381,10 @@ an_extremely_long_function_name_well_past_thirty crate::deeply::nested::module::
             start_line: 12,
             complexity: 3,
             coverage: Some(0.5),
+            lines: Some(crate::join::LineCounts {
+                covered: 1,
+                total: 2,
+            }),
             crap: crate::crap::score(3, Some(0.5)),
         }];
         let rows = rows_from_joined(&joined);
@@ -297,6 +408,10 @@ an_extremely_long_function_name_well_past_thirty crate::deeply::nested::module::
             start_line: 12,
             complexity: 3,
             coverage: Some(0.5),
+            lines: Some(crate::join::LineCounts {
+                covered: 1,
+                total: 2,
+            }),
             crap: crate::crap::score(3, Some(0.5)),
         }];
         let rows = rows_from_joined(&joined);

@@ -64,7 +64,7 @@ Walking skeleton first, then layer outward.
 | S1 | **Walking skeleton**: `crap4rust --lcov-path X <crate>` parses one crate's `syn` AST, computes CC + CRAP from provided LCOV, prints "CRAP Report" table. No coverage running, no gate. | – |
 | S2 | **Zero-config coverage**: run `cargo llvm-cov` → `target/crap4rust/coverage.lcov`, then compute. `--test-command` override, `--lcov-path` BYO. | S1 |
 | S3 | **Workspace/monorepo**: enumerate workspace members; Package→Module crate-qualified naming; product-vs-test filtering; positional path-fragment filters. **Complete** (T9, T9b, T10). | S1 |
-| S4 | **JSON contract**: versioned `--format json` output. | S1, S3 |
+| S4 | **JSON contract**: versioned `--format json` output. **Code complete** (T11); the *published* contract is owed by T13 (FC-T11d). | S1, S3 |
 | S5 | **Polish/perf**: `rayon` parallelism (`-j/--jobs`), display-band coloring, docs of async/macro limits, error UX. | S2–S4 |
 
 ## Tasks (Tx)
@@ -84,9 +84,9 @@ One or more tasks per slice.
 | T9  | S3 | **Workspace enumeration** — cargo metadata; per-member modules, crate-qualified (C3). Checklist: replace `report::rows_from_joined` module derivation (FC-T6a); move source discovery out of `cli.rs` into its adapter; FC-T5a longest-overlap + `Ambiguous` resolution; FC-T5e `SourceUnit` refactor. | **Done** | vibe/001 |
 | T9b | S3 | **Diagnostic unification + single-parse streaming** (human-inserted, 2026-08-24). Discharges FC-T9d (one `Diagnostic{code,severity,phase,site,kind}`, one sink drained on `Err` **and** `Ok`), FC-T9h (discovery streams each parsed AST; one parse per file) and FC-T9k (`workspace/` split). Also lands C18 (incomplete-report notice), C19 (exact-wins collisions), C20 (module/name normalisation). | **Done** | vibe/001 |
 | T10 | S3 | **Product/test filtering** — exclude `#[cfg(test)]`/`#[test]`; `tests/`/`benches/`/`examples/` non-product; positional path-fragment filters (C5). Also FC-T9g (drop empty units before the join), FC-T9e (query key ≠ display path), FC-T9j (PATH is a locator; filters get their own surface). Also landed C22 (declined counts distinct modules), C25 (source-only MSRV floor + `msrv` CI job), C26 (filter is a reporting narrowing), C27 (zero-row report says so), C29 (case-sensitive). **Closes S3.** | **Done** | vibe/001 |
-| T11 | S4 | **JSON reporter** — versioned schema (`schema_version`), stable field contract. | Pending | - |
+| T11 | S4 | **JSON reporter** — versioned schema (`schema_version`), stable field contract. Landed C30 (flat wire, sections in the type system), C31 (compatibility policy), C32 (`crap4rust_version`), C33 (`declined_modules`), C34 (`covered_lines`/`total_lines`), C35 (C14 narrow waiver), C36 (total ordering as deliberate divergence). **S4's code closes**; the published contract is FC-T11d, owed by T13. | **Done** | vibe/001 |
 | T12 | S5 | **Parallelism** — `rayon` across members/files; `-j/--jobs`, full CPUs default (C7). | Pending | - |
-| T13 | S5 | **Docs & limits** — async/macro CC caveats (C12), README, `--help`. Must document: FC-T8f "no spaces in `--test-command`" (workaround `--lcov-path`); the C17 crap4go `--test-command` divergences + `{lcov}` vs `{coverprofile}` migration note; FC-T5c (`total==0` renders `100.0%`); C15 duplicate-display-name rows. | Pending | - |
+| T13 | S5 | **Docs & limits** — async/macro CC caveats (C12), README, `--help`. Must document: FC-T8f "no spaces in `--test-command`" (workaround `--lcov-path`); the C17 crap4go `--test-command` divergences + `{lcov}` vs `{coverprofile}` migration note; FC-T5c (`total==0` renders `100.0%`); C15 duplicate-display-name rows. **Plus FC-T9l, FC-T11d (the consumer-facing schema doc — the other half of the freeze), FC-T11e, FC-T11f**, C22's lower bound, C25's MSRV caveats in the README not just a `Cargo.toml` comment, C29's Windows case-sensitivity surprise, `#[tokio::test]` measured as product, the `cfg(test)`-decidability rule, upstream's *arbitrary* map-iteration suffix match (T11 finding), and that the coverage profile contains test lines — the join is safe only because it intersects each function's own span. | Pending | - |
 
 ### Test expectations (inline)
 
@@ -492,9 +492,10 @@ complete input set.*
 - **FC-T10d (two sections never merged).** The request echo (C28/FC-T10a) and the findings are distinct
   kinds of fact. Discriminator: *would this value differ if the same request produced a different
   artifact?* If no, it is request echo; if yes, it is a finding. Never let one drift into the other.
-- **FC-T10e (JSON carries `declined` only — no redundant `rows`).** Corrects the "two structural
-  fields" reading of FC-T9n: `functions.length` **is** the row count. Emitting a count beside the array
-  creates a second source of truth that can disagree with the first.
+- **FC-T10e (JSON carries the declined count only — no redundant `rows`).** Corrects the "two
+  structural fields" reading of FC-T9n: `functions.length` **is** the row count. Emitting a count
+  beside the array creates a second source of truth that can disagree with the first. *(The field
+  shipped at T11 as `declined_modules` — see C33.)*
 - **FC-T10f (display-identity ≠ query-key is a STANDING invariant).** FC-T9e is
   **discharged-with-standing-invariant**, not closed. `query_key` strips leading `../` for the LCOV
   query **only**; the display path is untouched. Any future normalisation must preserve the split.
@@ -505,8 +506,184 @@ complete input set.*
   order); verified end-to-end with no unordered collection in the chain. **T12 must preserve it** when
   rayon lands — the integration assertion says so out loud rather than failing mysteriously later.
 
-### C16 — Bidirectional path matching — **DELIBERATE DIVERGENCE (verified, 2026-08-24)**
+### C30–C36 — Human rulings on T11 (the schema freeze, 2026-08-24)
 
+- **C30 — the wire is FLAT; the section boundary is enforced in the type system.** C28's literal
+  "top-level `filters: [...]`" governs the wire; FC-T10d's "two sections, never merged" is a rule about
+  **classification**, not nesting depth. `Request`/`Findings` as separate Rust types make drift a
+  **compile error**, permanently, in the only place drift can happen — a JSON object boundary enforces
+  nothing. Anders' honest counter, accepted as a documentation debt: a consumer **diffing two runs**
+  wants to ignore the echo, and flat makes that partition out-of-band knowledge that will **grow**.
+  **T13 must name which keys are request-echo and state that the set may grow.** Without that, flat is
+  the worse choice; with it, it is fine.
+- **C31 — compatibility policy (the real freeze risk).** Silence at freeze time means *strict*, and a
+  strict decoder means the schema can never grow. Recorded verbatim on `SCHEMA_VERSION`:
+  > `schema_version` bumps only when a document valid under v1 would stop being produced or would
+  > change meaning. Adding a top-level key, a `warnings[].code`, a `data` key, a `coverage_caveat` tag,
+  > a `coverage_source` value, or a `functions[]` field is **additive and does not bump**. Consumers
+  > must ignore unknown keys and unknown enum values, and must not assume a closed set for `code`,
+  > `coverage_caveat`, or `coverage_source`. Removing or renaming anything, or changing a field's type
+  > or meaning, bumps.
+- **C32 — `crap4rust_version` is in the document**, from `env!("CARGO_PKG_VERSION")`, in `Request`.
+  `schema_version` describes the *shape*; nothing described the *producer*. C1's counting rules and
+  C16's heuristics will evolve, and a consumer diffing across an upgrade could not otherwise tell the
+  numbers moved because the **tool** changed rather than the code. Byte-lock tests **splice** the
+  version rather than spelling it, so a release is not a test edit.
+- **C33 — `declined` → `declined_modules`.** `"declined": 1` beside `"functions": [...]` reads as one
+  declined *function*; it is **distinct modules**, and the unit was unrecoverable from the document.
+  Stays a **bare integer** — not `{count, exact}`; the C22 lower-bound caveat is documentation's job,
+  and `warnings[]` already names *which* modules were declined, strictly more information than an
+  `exact` flag.
+- **C34 — `covered_lines` / `total_lines` per row.** `coverage` is a bare ratio, so C13's
+  `total == 0 ⇒ 1.0` was **invisible**, and a consumer **could not aggregate coverage at all**
+  (averaging per-function ratios is arithmetically wrong and there was no weight to use). **Not
+  derivable**, so unaddable later without a bump. Implemented with one source: `coverage_for` became
+  `line_counts -> Option<LineCounts>`, and `LineCounts::fraction()` is now **the only place a coverage
+  ratio is computed anywhere** — the reporters never divide. File-absent ⇒ **both counts `null`**,
+  exactly when `coverage` is `null` (`0` would assert "we counted zero instrumented lines", a different
+  and false statement). **The table is untouched**: this is the one deliberate, ruled widening of JSON
+  beyond what the table reports.
+- **C35 — C14 is AMENDED (narrow waiver).** The byte-lock permits **fixture-only** edits that add a
+  **required struct field**, provided **no assertion, no expected output string, and no test name or
+  order changes**. Forced by C34: Rust has no optional struct fields, and two locked tests construct
+  `JoinedFunction` as a literal. Bhaskar verified character by character that removing the two added
+  blocks makes the test region byte-identical to `8b5f853`, and independently found **no sound third
+  option** — the alternatives were a type whose only purpose is keeping a test compiling, or the
+  parallel-vector shape that caused the many-to-one bug three times. **The lock's purpose is unchanged
+  and absolute**: the table's bytes must not move and no assertion may be quietly relaxed.
+  **Three tightenings (Anders), binding on every future invocation:** (a) **field addition only** — no
+  existing field's **value** may change; (b) the byte-identity proof is **part of the waiver**, not of
+  this episode — *"remove the added blocks ⇒ the test region is byte-identical to `<base>`"* must be
+  **recorded** each time, because a self-certifying waiver on a byte-lock is not a lock; (c)
+  **exhaustion** — it applies only when the field is *required by the type system* and no
+  `Default`/`Option` shape would preserve the fixture, and the author must state which alternatives
+  were rejected.
+- **C36 — the total ordering is a DELIBERATE DIVERGENCE, in the same register as C16.** The comment
+  justifying it was **factually false** — it claimed crap4go uses unstable `sort.Slice`. At
+  `bee16dbdadb4af927a7792083f3cba2ae58841ed`, `SortByCRAP` uses **`sort.SliceStable`**, and
+  `findSourceFiles` ends in `sort.Strings`, so upstream's tie order is **stable and knowable**: sorted-
+  file order, then declaration order within each file. `Name` is consulted **only** when both CRAP
+  values are `nil`. **We have diverged since T6** — our comparator breaks *scored* ties on `name`,
+  which upstream never consults, locked by `equal_crap_ties_break_by_name_ascending` (`09b47de`). T11
+  did **not** introduce the divergence; it refined what *our own* comparator left undefined **below**
+  that tiebreak, replacing module-graph BFS order with C15 identity. Ordering is now
+  **CRAP desc → `None` last → `name` → `file` → `start_line`** — total, so it no longer depends on the
+  sort being stable, which is what lets T12 use an unstable `par_sort_by` safely.
+
+### T11 review notes (Bhaskar FAIL ×4 → PASS; Anders — approve-with-suggestions; **S4's code closes**, 2026-08-24)
+
+**Three false claims-in-comments in one task**, all found by verification rather than by the author's
+green gate. This is now the branch's dominant defect class and outranks logic errors by frequency:
+1. `serde_json` declared under `[dev-dependencies]` with a comment asserting dev-only/MSRV isolation —
+   it was already a **production** dependency and is used by `src/json.rs`.
+2. The C36 `sort.Slice` claim above — calling **deterministic** upstream behaviour arbitrary.
+3. `coverage.rs::suffix_overlap` claiming upstream "takes the **first** match" — `segmentsForFile`
+   ranges over a **Go map**, whose iteration order is randomized, so it takes an **arbitrary** one.
+   The opposite failure mode of (2), and it **strengthens** FC-T5a: upstream is nondeterministic
+   exactly where we refuse to guess. **T13 must document this.**
+Standing instruction, now proven three times: **a comment asserting a property the build or the
+reference does not have is a defect of the same grade as a wrong number.** Every crap4go claim in the
+tree was swept against the pinned source; the remainder verified correct.
+
+**Structural fix (Anders), not merely verification.** The three failures are three classes, two closable:
+- **Claims about our own build** — machine-checkable, so *stop restating them*. **Rule: a comment must
+  not restate a fact stated by an adjacent machine-readable file — it must cite it.** "Production dep,
+  see `[dependencies]`" cannot drift; "dev-only, MSRV-isolated" can and did. This class goes to **zero**.
+- **Claims about crap4go** — checkable only against the pin, and three could hide because they are
+  **scattered** across `coverage.rs`, `report.rs`, `join.rs`, `crap.rs` and this file. **Every upstream
+  claim must carry `repo@sha` + file + symbol, and the set must be enumerable in one place** (a parity
+  doc, or a `parity` module doc the others link to). That turns archaeology into a bounded, re-runnable
+  audit. **T13 owns this.**
+- **Claims about our own invariants** ("the only place a ratio is computed") — already the good
+  pattern: true because the type makes it true, and a test would catch a second divisor.
+
+Generalised: **prefer a type or a test to a citation, and a citation to a restatement.** An intra-doc
+link is a citation *the compiler checks* — which is why T11's broken-link failure was a good failure
+(see FC-T11h).
+
+**Standing habit from finding #4: for every lock, ask which regression it is structurally incapable of
+catching.** The nine C14 tests passed for four tasks without being *able* to fail on tie order.
+
+**The byte-lock was weaker than we believed.** None of the nine locked `report.rs` tests contained two
+rows sharing CRAP **and** name, so none could have caught the ordering hole. It surfaced only because a
+`tests/cli.rs` table expectation failed — luck, not design. Closed by
+`equal_crap_and_name_break_by_file_then_start_line`, which exercises both legs below `name` and asserts
+rendered bytes.
+
+**Endorsed by Anders.** `Attribution::caveat()` as the single five-state classifier consumed by both
+edges; `order_by_crap` shared rather than copied; presentation moved **behind** format selection rather
+than appended (FC-T9n discharged in its **strong** form — the integration test asserts stdout
+**equality**, so nothing can ever be concatenated on); `json.rs` a pure `String`-returning edge.
+**`JoinedFile` is the better design, not a byte-lock workaround**: attribution is a per-*file* fact, and
+two parallel vectors keyed by a path string was the many-to-one bug's **fourth site** sitting there
+loaded. **FC-T9b\* is recorded as satisfied-in-superseding-form.** `coverage_caveat` keeps `null`-for-
+exact ("exact" is not a caveat — the field naming a state that is not one is a category error).
+`coverage_source` rightly excludes the LCOV path: it would be **the only absolute path in the
+document**, breaking the invariant that every path is a workspace-relative forward-slashed C15 identity,
+and leaking home directories into artifacts people paste into issues. What a reproducing consumer would
+want is a **digest**, not a location — a legitimate future addition under C31, not a v1 need. No `band`
+(derivable), no summary object (FC-T10e's second-source-of-truth wearing a different hat).
+
+**Forward constraints.**
+- **FC-T11a (ordering is total and contractual).** `order_by_crap` is the sole ordering for both
+  reporters; key is C36's. T12 may use `par_sort_by` **only** because the comparator is total; never
+  with a partial one. No reporter may re-sort or inherit input order. **The order of `functions[]` is
+  itself contractual** — C31 as first drafted enumerated keys, values and types but not *order*, so a
+  literal reader could reorder rows and call it non-breaking. Changing the ordering key **bumps**.
+  Totality further depends on `file`+`start_line` being **unique**: if any source were ever analysed
+  twice, the chain terminates in `Equal` again and an unstable sort reopens the hole.
+  `a_source_named_by_two_packages_is_analysed_exactly_once` is therefore **load-bearing for ordering**,
+  not only for correctness.
+- **FC-T11b (join input order stays contractual under rayon).** `Collision.sources` is join-input order
+  and is now **emitted** in `warnings[].data.claimants`. T12 must preserve `JoinedFile` order and the
+  claim-map insertion order; parallelising the claim map or reordering units **changes the frozen
+  document**. With FC-T9i: enumeration sequential, measurement parallel over a bounded window, ASTs
+  never buffered to restore a sort order.
+- **FC-T11c (the wire tags are append-only).** Eleven `code` strings, five `Caveat::tag()` values, two
+  `coverage_source` values, two `phase` values, one `severity` value. Adding is free under C31;
+  renaming is breaking **even though nothing in this crate would notice**. The byte-lock tests are the
+  enforcement — **never "update" one to match a rename.**
+- **FC-T11d (T13 owns the consumer-facing schema doc).** Every contract statement currently lives in
+  `pub(crate)` rustdoc, which **never reaches `cargo doc`**, and there is no README. A contract that
+  exists only in crate-private rustdoc **is not published**. T13 must produce a schema section
+  covering: the field list; the request-echo/findings partition and that the echo set may grow (C30's
+  mitigation); C31's policy; `declined_modules` as distinct modules **and a lower bound**; FC-T10c
+  non-closure; `total == 0 ⇒ 1.0`; `"suffix"` meaning **scored but possibly from another file's
+  numbers** (the one state that looks like an answer — a CI-gating consumer needs
+  `coverage != null && caveat == "suffix"` separable from `coverage == null`); filters echoed
+  **unnormalised**, so `crates\alpha` and `crates/alpha` produce different documents for the same
+  logical run; and C15 identity being `file` + `start_line`. **Carve-out (Anders):** the doc will tell
+  consumers the request echo is the ignorable half when diffing two runs — that is **wrong for
+  `crap4rust_version`**, the one echo key whose change is precisely the explanation a diffing consumer
+  is looking for. C32's justification collapses if the doc says to ignore the partition it sits in.
+- **FC-T11g (`warnings[]` emission order is in the frozen document too).** Parallel measurement will
+  yield run-phase diagnostics in **completion** order unless they are collected per-unit and
+  concatenated in unit order. The classic rayon regression, and it changes a frozen artifact silently.
+  **Cheap gate Anders recommends: a run-twice-assert-byte-identical-JSON integration test** — no timing
+  dependence, and it is the one test that would catch FC-T11a, FC-T11b and FC-T11g at once.
+- **FC-T11h (rustdoc is ungated documentation debt).** `cargo doc` is **not** in the Commands table, so
+  neither gate can catch a rotted intra-doc link — two broken links survived a full green gate at T11
+  and were found only by an explicit docs build. **Six warnings remain**, all introduced earlier on
+  this branch and none attributable to T11: five of the "resolves only under `--document-private-items`"
+  class (`src/cli.rs:18,20,28,28` and `:150`) and one **genuinely dangling**
+  (`src/workspace/modgraph.rs:19` → `crate::complexity::analyze_str`, which is `#[cfg(test)]`-only).
+  An intra-doc link is **the only citation in this codebase the compiler checks**, and FC-T11d makes
+  docs load-bearing for the published contract — so from T13 a rotted link is a rotted *contract
+  reference*. Dave's recommended shape, for the human: `#![deny(rustdoc::broken_intra_doc_links,
+  rustdoc::private_intra_doc_links)]` in `src/lib.rs` (a **source** fact, not a CI-shell fact — no
+  `RUSTDOCFLAGS` differing between PowerShell and bash across the ubuntu/windows matrix, and it fires
+  locally too) plus a `doc-check` row running `cargo doc --no-deps --document-private-items` on the
+  **full gate only**. `--document-private-items` is **not optional**: nearly everything here is
+  `pub(crate)`, so without it most links are never resolved. Clearing the six is the precondition.
+- **FC-T11e (`ReportRow` cleanup).** `ReportRow` is C14's **display projection**; `file`/`start_line`
+  are read only as A1's tiebreak. Delete them in T13 (which means ordering the table over
+  `JoinedFunction`), or restate the comment as a deletion candidate. **No task may add a field to
+  `ReportRow` that the table does not render.**
+- **FC-T11f (the MSRV gate can go red with zero source change.)** C25's job deletes and regenerates the
+  lock, so a transitive dependency raising its own floor turns it red. That is **dependency drift, not
+  a regression** — a future agent must not "fix" it by editing our source. T13 documents this.
+
+### C16 — Bidirectional path matching — **DELIBERATE DIVERGENCE (verified, 2026-08-24)**
 
 crap4go's `suffixMatch` (`internal/coverage/coverage.go`, `unclebob/crap4go` @ `bee16db`) is
 **one-directional** — it returns `false` as soon as `len(suffixParts) > len(pathParts)`, so only the

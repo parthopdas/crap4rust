@@ -84,6 +84,57 @@ DA:13,1
 end_of_record
 ";
 
+/// The JSON document `--format json` emits for [`fixture`] — the T11 schema
+/// freeze, whole and byte-for-byte. Two sections, in order: what was asked for
+/// (`crap4rust_version`, `filters`, `coverage_source` — C28/FC-T10d) and what
+/// was found (`functions`, `declined_modules`, `warnings`). `functions[]` is
+/// C14-ordered (FC-T9q), so `risky` precedes `covered` even though `covered` is
+/// declared first.
+///
+/// The producer version is spliced in rather than spelled: pinning it here
+/// would make every release a test edit, and it is the one value in the
+/// document that is *supposed* to move.
+fn json_document() -> String {
+    format!(
+        r#"{{
+  "schema_version": 1,
+  "crap4rust_version": "{}",
+  "filters": [],
+  "coverage_source": "provided",
+  "functions": [
+    {{
+      "name": "risky",
+      "module": "demo",
+      "file": "src/lib.rs",
+      "start_line": 5,
+      "complexity": 6,
+      "coverage": 0.0,
+      "covered_lines": 0,
+      "total_lines": 7,
+      "crap": 42.0,
+      "coverage_caveat": null
+    }},
+    {{
+      "name": "covered",
+      "module": "demo",
+      "file": "src/lib.rs",
+      "start_line": 1,
+      "complexity": 1,
+      "coverage": 1.0,
+      "covered_lines": 1,
+      "total_lines": 1,
+      "crap": 1.0,
+      "coverage_caveat": null
+    }}
+  ],
+  "declined_modules": 0,
+  "warnings": []
+}}
+"#,
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 /// An isolated fixture directory that deletes itself when the test ends.
 ///
 /// Cleanup is a [`Drop`], so it also runs when an assertion panics — the same
@@ -901,6 +952,12 @@ fn every_target_is_enumerated_and_named_by_its_target_not_its_package() {
     // The whole report is asserted, not sampled: an exact match is the only
     // way a file analysed *twice* — the cross-target and cross-package dedup
     // failure — cannot slip through.
+    //
+    // The three `main` rows share a CRAP *and* a name, so they are ordered by
+    // the C15 identity that breaks the tie totally: `cmd/tool.rs` <
+    // `crates/solo/cmd/main.rs` < `src/bin/tool.rs`. Before the ordering was
+    // made total they came out in module-graph (BFS) order — this fixture is
+    // where that traversal detail was leaking into the output.
     let dir = multi_target_fixture("multi_target");
     fs::write(
         dir.join("coverage.lcov"),
@@ -927,8 +984,8 @@ aliased_one                    alpha::aliased                         1  100.0% 
 alpha_one                      alpha                                  1  100.0%      1.0
 helper_one                     renamed::helper                        1  100.0%      1.0
 main                           renamed                                1  100.0%      1.0
-main                           tool                                   1  100.0%      1.0
 main                           solo_tool                              1  100.0%      1.0
+main                           tool                                   1  100.0%      1.0
 renamed_one                    renamed                                1  100.0%      1.0
 solo_one                       solo_tool                              1  100.0%      1.0
 tool_one                       tool                                   1  100.0%      1.0
@@ -1964,4 +2021,345 @@ shared_one                     shared                                 1  100.0% 
     assert_eq!(stderr.lines().count(), 1, "stderr: {stderr}");
     assert!(stderr.contains("../shared/tool.rs"), "stderr: {stderr}");
     assert!(stderr.contains("suffix match"), "stderr: {stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// T11 — the JSON reporter (`--format json`). The schema freeze.
+// ---------------------------------------------------------------------------
+
+/// Parse the document the binary actually emitted, so a trailing notice
+/// concatenated onto it (FC-T9n) fails here rather than in a consumer.
+fn json_of(output: &Output) -> serde_json::Value {
+    let stdout = stdout_of(output);
+    serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"))
+}
+
+/// The whole document, byte-for-byte, for the standard fixture. Nothing
+/// precedes or follows it on stdout.
+#[test]
+fn json_format_emits_the_versioned_document_and_nothing_else() {
+    let dir = fixture("json_document");
+    let out = run_in(
+        &dir,
+        &["--format", "json", "--lcov-path", "coverage.lcov", "src"],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(stderr_of(&out), "");
+    assert_eq!(stdout_of(&out), json_document());
+}
+
+/// C14 is untouched: JSON is an *additional* reporter, and the default is
+/// still the table.
+#[test]
+fn the_table_is_still_the_default_format() {
+    let dir = fixture("json_default");
+    let table = run_in(&dir, &["--lcov-path", "coverage.lcov", "src"]);
+    let explicit = run_in(
+        &dir,
+        &["--format", "table", "--lcov-path", "coverage.lcov", "src"],
+    );
+
+    assert_eq!(stdout_of(&table), stdout_of(&explicit));
+    assert!(
+        stdout_of(&table).starts_with("CRAP Report\n"),
+        "{}",
+        stdout_of(&table)
+    );
+}
+
+/// FC-T9n: the C18 notice is *presentation*. It is the table's rendering of a
+/// fact the document carries as `declined_modules`, so it must never be concatenated
+/// onto the JSON — which would leave it unparseable.
+#[test]
+fn the_declined_notice_is_a_field_in_json_and_never_trailing_text() {
+    let dir = fixture("json_declined");
+    fs::write(
+        dir.join("src").join("lib.rs"),
+        format!("mod absent;\n\n{SOURCE}"),
+    )
+    .expect("write source declaring a missing module");
+    fs::write(
+        dir.join("coverage.lcov"),
+        LCOV.replace("DA:2,3", "DA:4,3").replace("DA:6,", "DA:8,"),
+    )
+    .expect("write shifted lcov");
+
+    let out = run_in(
+        &dir,
+        &["--format", "json", "--lcov-path", "coverage.lcov", "."],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    // The *table's* notice, not the warning text (which legitimately says a
+    // module "is not analysed"). `json_of` proves nothing was appended at all.
+    assert!(
+        !stdout_of(&out).contains("module not analysed (see stderr)"),
+        "{}",
+        stdout_of(&out)
+    );
+    let document = json_of(&out);
+    assert_eq!(document["declined_modules"], 1);
+    // The same fact, as a warning, with its particulars.
+    assert_eq!(document["warnings"][0]["code"], "module-file-missing");
+    assert_eq!(document["warnings"][0]["data"]["module"], "demo::absent");
+    assert_eq!(document["warnings"][0]["phase"], "run");
+    assert_eq!(document["warnings"][0]["severity"], "warning");
+    // The table says the same thing in prose, from the same predicate.
+    let table = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+    assert!(
+        stdout_of(&table).ends_with("\n\n1 module not analysed (see stderr)\n"),
+        "{}",
+        stdout_of(&table)
+    );
+}
+
+/// C27's zero-row line is presentation too: an empty document says so by
+/// having an empty `functions[]`, not by a trailing sentence.
+#[test]
+fn an_empty_json_report_is_an_empty_array_not_a_sentence() {
+    let dir = fixture("json_empty");
+    let out = run_in(
+        &dir,
+        &[
+            "--format",
+            "json",
+            "--filter",
+            "crates/gone",
+            "--lcov-path",
+            "coverage.lcov",
+            ".",
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert!(
+        !stdout_of(&out).contains("no functions reported"),
+        "{}",
+        stdout_of(&out)
+    );
+    let document = json_of(&out);
+    assert_eq!(document["functions"].as_array().expect("array").len(), 0);
+    // C28: and the reader can see *why* it is empty.
+    assert_eq!(document["filters"][0], "crates/gone");
+    assert_eq!(document["warnings"][0]["code"], "filter-matched-nothing");
+    assert_eq!(document["warnings"][0]["file"], serde_json::Value::Null);
+}
+
+/// C28 + C26: the document echoes the request, and the numbers are invariant
+/// under it — a filtered row is byte-identical to its unfiltered self.
+#[test]
+fn the_document_echoes_the_filters_without_changing_any_number() {
+    let dir = workspace_fixture("json_filters");
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:src/lib.rs\nDA:2,0\nend_of_record\n\
+         SF:crates/beta/src/lib.rs\nDA:2,1\nend_of_record\n",
+    )
+    .expect("write workspace lcov");
+    let all = run_in(
+        &dir,
+        &["--format", "json", "--lcov-path", "coverage.lcov", "."],
+    );
+    let narrowed = run_in(
+        &dir,
+        &[
+            "--format",
+            "json",
+            "--filter",
+            "crates/beta",
+            "--lcov-path",
+            "coverage.lcov",
+            ".",
+        ],
+    );
+
+    assert_eq!(all.status.code(), Some(0), "stderr: {}", stderr_of(&all));
+    let all = json_of(&all);
+    let narrowed = json_of(&narrowed);
+
+    assert_eq!(all["filters"].as_array().expect("array").len(), 0);
+    assert_eq!(narrowed["filters"][0], "crates/beta");
+    // Request echo, not a finding: `--lcov-path` was given both times.
+    assert_eq!(all["coverage_source"], "provided");
+
+    let beta_of = |document: &serde_json::Value| {
+        document["functions"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|f| f["name"] == "beta_one")
+            .cloned()
+            .unwrap_or_else(|| panic!("no beta_one row in {document}"))
+    };
+    assert_eq!(beta_of(&all), beta_of(&narrowed));
+    assert_eq!(narrowed["functions"].as_array().expect("array").len(), 1);
+}
+
+/// FC-T9a/C20 on the wire: `module` is the full path (crate + file scope +
+/// inline segments) and `name` is the bare name. Neither field has a stable
+/// meaning if the split moves, and in JSON they are read separately.
+#[test]
+fn json_rows_split_module_and_name_the_same_way_for_inline_modules() {
+    let dir = fixture("json_module_split");
+    fs::write(
+        dir.join("src").join("lib.rs"),
+        "mod inner {\n    pub fn bar() -> i32 {\n        1\n    }\n}\n",
+    )
+    .expect("write source with an inline module");
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:src/lib.rs\nDA:3,1\nend_of_record\n",
+    )
+    .expect("write lcov");
+
+    let out = run_in(
+        &dir,
+        &["--format", "json", "--lcov-path", "coverage.lcov", "."],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    let row = json_of(&out)["functions"][0].clone();
+    assert_eq!(row["name"], "bar");
+    assert_eq!(row["module"], "demo::inner");
+    assert_eq!(row["file"], "src/lib.rs");
+    assert_eq!(row["start_line"], 2);
+}
+
+/// FC-T9b*: a suffix-matched file is **scored** — the row is not null — but it
+/// is flagged, because the numbers may be another file's. The row's caveat and
+/// the warning about the same file come from one classifier.
+#[test]
+fn a_suffix_matched_row_is_scored_and_flagged() {
+    let dir = fixture("json_suffix");
+    fs::write(
+        dir.join("coverage.lcov"),
+        LCOV.replace("SF:src/lib.rs", "SF:/build/demo/src/lib.rs"),
+    )
+    .expect("write lcov with a build-root-absolute key");
+
+    let out = run_in(
+        &dir,
+        &["--format", "json", "--lcov-path", "coverage.lcov", "."],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    let document = json_of(&out);
+    for row in document["functions"].as_array().expect("array") {
+        assert_eq!(row["coverage_caveat"], "suffix", "{row}");
+        assert!(!row["coverage"].is_null(), "{row}");
+    }
+    assert_eq!(document["warnings"][0]["code"], "coverage-suffix-match");
+    assert_eq!(
+        document["warnings"][0]["data"]["key"],
+        "/build/demo/src/lib.rs"
+    );
+    // Same facts on stderr, unchanged by the format (C6 keeps exit 0).
+    assert!(
+        stderr_of(&out).contains("suffix match"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+/// FC-T10c: under `--filter`, a `winner` is a byte-identical row identity
+/// (FC-T9o) that may have **no row** in this document — attribution is
+/// whole-workspace truth (C26). Correct, and not referentially closed.
+#[test]
+fn a_superseded_winner_may_name_a_file_that_has_no_row() {
+    let dir = workspace_fixture("json_superseded");
+    // One record, keyed exactly like the root package's file: beta's claim on
+    // it is a suffix claim and loses (C19).
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:src/lib.rs\nDA:2,1\nend_of_record\n",
+    )
+    .expect("write lcov");
+
+    let out = run_in(
+        &dir,
+        &[
+            "--format",
+            "json",
+            "--filter",
+            "crates/beta",
+            "--lcov-path",
+            "coverage.lcov",
+            ".",
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    let document = json_of(&out);
+    let files: Vec<&str> = document["functions"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|f| f["file"].as_str().expect("file is a string"))
+        .collect();
+    assert_eq!(files, ["crates/beta/src/lib.rs"]);
+    assert_eq!(document["functions"][0]["coverage_caveat"], "superseded");
+    assert_eq!(
+        document["functions"][0]["coverage"],
+        serde_json::Value::Null
+    );
+    assert_eq!(document["warnings"][0]["code"], "coverage-superseded");
+    // The winner is named by an identity no row here carries.
+    assert_eq!(document["warnings"][0]["data"]["winner"], "src/lib.rs");
+    assert!(!files.contains(&"src/lib.rs"), "{files:?}");
+}
+
+/// A generated profile is echoed as such (C28): the same command, run against
+/// the same workspace, is a different request when it computes its own
+/// coverage.
+#[test]
+fn a_generated_profile_is_echoed_as_generated() {
+    let dir = fixture("json_generated");
+    let out = run_in(
+        &dir,
+        &[
+            "--format",
+            "json",
+            "--test-command",
+            artifact_producing_command(),
+            ".",
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(json_of(&out)["coverage_source"], "generated");
+}
+
+/// FC-T7e/FC-T8g, ruled: config-phase facts belong **inside** the document.
+/// `crap4rust --format json . > report.json` is the artifact, and a coverage
+/// command that was silently ignored is exactly the kind of fact a reader of
+/// that file must not have to have watched stderr to learn. It is still on
+/// stderr too — the stream and the artifact are different channels.
+#[test]
+fn config_phase_warnings_are_carried_in_the_document_and_on_stderr() {
+    let dir = fixture("json_config_phase");
+    let out = run_in(
+        &dir,
+        &[
+            "--format",
+            "json",
+            "--lcov-path",
+            "coverage.lcov",
+            "--test-command",
+            "never-run",
+            ".",
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    let warning = json_of(&out)["warnings"][0].clone();
+    assert_eq!(warning["code"], "ignored-test-command");
+    assert_eq!(warning["phase"], "config");
+    assert_eq!(warning["file"], serde_json::Value::Null);
+    assert_eq!(warning["line"], serde_json::Value::Null);
+    assert!(
+        stderr_of(&out).contains("--test-command ignored"),
+        "{}",
+        stderr_of(&out)
+    );
 }

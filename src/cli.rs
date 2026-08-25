@@ -40,13 +40,14 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use crate::diagnostic::{Kind, Site};
 use crate::filter::Filters;
-use crate::join::SourceUnit;
+use crate::join::{JoinedFile, JoinedFunction, SourceUnit};
+use crate::json::CoverageSourceEcho;
 use crate::runner::CoverageSource;
-use crate::{complexity, coverage, join, report, workspace};
+use crate::{complexity, coverage, join, json, report, workspace};
 
 /// `crap4rust [--lcov-path <PATH>] [--test-command <COMMAND>] [--filter
 /// <FRAGMENT>]... <PATH>`.
@@ -89,6 +90,15 @@ pub struct Cli {
     #[arg(long, value_name = "FRAGMENT")]
     filter: Vec<String>,
 
+    /// Output format: the human-readable table, or the versioned JSON document.
+    ///
+    /// The table is C14's frozen layout and stays the default. `json` emits a
+    /// `schema_version`-stamped document that carries structurally what the
+    /// table can only say in prose — the per-row coverage caveat, the declined
+    /// count, the warnings, and an echo of the request itself (C28).
+    #[arg(long, value_name = "FORMAT", default_value = "table")]
+    format: Format,
+
     /// A path inside the cargo workspace to analyse.
     ///
     /// Only used to find the workspace: cargo searches this path and its
@@ -97,6 +107,22 @@ pub struct Cli {
     /// (FC-T9j).
     #[arg(value_name = "PATH")]
     path: PathBuf,
+}
+
+/// Which reporter renders the run (`--format`).
+///
+/// The choice is made **inside** [`run`] (FC-T7b): `main` prints one string
+/// and knows nothing about formats, so everything that is *presentation* —
+/// including the C18/C27 caveat lines the table trails — stays behind this
+/// selection rather than being appended to whatever the reporter produced
+/// (FC-T9n).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum Format {
+    /// C14's frozen "CRAP Report" table.
+    #[default]
+    Table,
+    /// The versioned JSON document (T11).
+    Json,
 }
 
 /// A run's resolved inputs (FC-T7c): defaults and flag precedence are settled
@@ -112,6 +138,8 @@ pub struct RunConfig {
     path: PathBuf,
     /// Which files reach the report (C5). Empty means all of them.
     filters: Filters,
+    /// Which reporter renders the run.
+    format: Format,
 }
 
 impl RunConfig {
@@ -125,6 +153,7 @@ impl RunConfig {
         lcov_path: Option<PathBuf>,
         test_command: Option<&str>,
         filters: &[String],
+        format: Format,
     ) -> Self {
         let (coverage, diagnostics) = CoverageSource::resolve(lcov_path, test_command);
         Self {
@@ -132,6 +161,7 @@ impl RunConfig {
             diagnostics,
             path,
             filters: Filters::new(filters),
+            format,
         }
     }
 
@@ -153,6 +183,7 @@ impl From<&Cli> for RunConfig {
             cli.lcov_path.clone(),
             cli.test_command.as_deref(),
             &cli.filter,
+            cli.format,
         )
     }
 }
@@ -227,6 +258,11 @@ impl Caveats {
 /// reported, and neither is a fuzzy, ambiguous or missing coverage match: those
 /// are diagnosed, not failed.
 pub fn run(config: &RunConfig, diagnostics: &mut Vec<Diagnostic>) -> anyhow::Result<String> {
+    // Everything this run appends, for the JSON document's `warnings[]`.
+    // Whatever the caller already had in the sink is the caller's, not this
+    // run's — `main` drains the config-phase facts before calling in (FC-T8g),
+    // and they are read back from `config` below rather than from here.
+    let entered = diagnostics.len();
     let lcov_path = config.coverage.ensure_lcov()?;
 
     let lcov = coverage::load(lcov_path)
@@ -263,9 +299,8 @@ pub fn run(config: &RunConfig, diagnostics: &mut Vec<Diagnostic>) -> anyhow::Res
     let declined = declined(&diagnostics[discovered..]);
 
     let joined = join::join(&lcov, &units);
-    let functions = retain_selected(joined.functions, &selected, |f| &f.file);
-    let attributions = retain_selected(joined.attributions, &selected, |(file, _)| file);
-    diagnostics.extend(attribution_diagnostics(&attributions));
+    let files = retain_selected(joined.files, &selected, |file| &file.file);
+    diagnostics.extend(attribution_diagnostics(&files));
     diagnostics.extend(
         config
             .filters
@@ -278,16 +313,54 @@ pub fn run(config: &RunConfig, diagnostics: &mut Vec<Diagnostic>) -> anyhow::Res
             }),
     );
 
-    let rows = report::rows_from_joined(&functions);
-    let mut report = report::format_report(&rows);
-    report.push_str(
-        &Caveats {
-            rows: rows.len(),
-            declined,
+    // Everything below is **presentation**, so it lives behind the reporter
+    // selection (FC-T9n): the C18 declined notice and the C27 zero-row line are
+    // the *table's* rendering of facts the JSON document carries structurally.
+    // Appended to the rendered report — as they were before there was a second
+    // reporter — they would be concatenated onto a JSON document, which would
+    // then not parse. Both sides count the same `declined`, from the one
+    // `Kind::declined_module` predicate.
+    match config.format {
+        Format::Table => {
+            let functions: Vec<JoinedFunction> =
+                files.into_iter().flat_map(|file| file.functions).collect();
+            let rows = report::rows_from_joined(&functions);
+            let mut report = report::format_report(&rows);
+            report.push_str(
+                &Caveats {
+                    rows: rows.len(),
+                    declined,
+                }
+                .render(),
+            );
+            Ok(report)
         }
-        .render(),
-    );
-    Ok(report)
+        Format::Json => json::render(
+            &files,
+            config.filters.fragments(),
+            coverage_echo(&config.coverage),
+            declined,
+            // Config phase first, then everything this run said (FC-T8g): the
+            // JSON document is the artifact, so it carries both, even though
+            // `main` has already put the config half on stderr.
+            &config
+                .diagnostics()
+                .iter()
+                .chain(&diagnostics[entered..])
+                .collect::<Vec<_>>(),
+        ),
+    }
+}
+
+/// Which coverage source the run was *asked* for (C28/FC-T10d).
+///
+/// Request echo, not a finding: it is decided by the arguments alone, so it
+/// reads the same whatever the profile turns out to contain.
+fn coverage_echo(source: &CoverageSource) -> CoverageSourceEcho {
+    match source {
+        CoverageSource::Existing(_) => CoverageSourceEcho::Provided,
+        CoverageSource::Generated { .. } => CoverageSourceEcho::Generated,
+    }
 }
 
 /// Drop everything the filters did not select, keeping the rest in order.
@@ -364,35 +437,34 @@ fn declined(diagnostics: &[Diagnostic]) -> usize {
 /// mapping — not the file — is what has to be fixed; a superseded claim names
 /// the file that proved the better claim (C19); an unresolved file says so
 /// plainly. All but the first two report `N/A` for their functions (C13).
-fn attribution_diagnostics(attributions: &[(String, join::Attribution<'_>)]) -> Vec<Diagnostic> {
-    attributions
+///
+/// **The classification is not made here** (FC-T9b\*). Which of the five
+/// states a file is in — and that an exact match is silent — is
+/// [`join::Attribution::caveat`], the same function the JSON reporter tags its
+/// rows from. This is only the wording: a [`join::Caveat`] maps one-for-one onto a
+/// [`Kind`], so stderr and the document can never disagree about a file.
+fn attribution_diagnostics(files: &[JoinedFile<'_>]) -> Vec<Diagnostic> {
+    files
         .iter()
-        .filter_map(|(file, attribution)| {
-            let kind = match attribution {
-                join::Attribution::Resolved(coverage::Resolution::Exact(_)) => return None,
-                join::Attribution::Resolved(coverage::Resolution::Suffix(key)) => {
-                    Kind::CoverageSuffixMatch {
-                        key: (*key).to_string(),
-                    }
-                }
-                join::Attribution::Resolved(coverage::Resolution::Ambiguous(keys)) => {
-                    Kind::CoverageAmbiguous {
-                        keys: keys.iter().map(|key| (*key).to_string()).collect(),
-                    }
-                }
-                join::Attribution::Resolved(coverage::Resolution::Unresolved) => {
-                    Kind::CoverageAbsent
-                }
-                join::Attribution::Collision { key, sources } => Kind::CoverageContested {
-                    key: (*key).to_string(),
-                    claimants: sources.clone(),
+        .filter_map(|file| {
+            let kind = match file.attribution.caveat()? {
+                join::Caveat::Suffix { key } => Kind::CoverageSuffixMatch {
+                    key: key.to_string(),
                 },
-                join::Attribution::Superseded { key, winner } => Kind::CoverageSuperseded {
-                    key: (*key).to_string(),
-                    winner: winner.clone(),
+                join::Caveat::Absent => Kind::CoverageAbsent,
+                join::Caveat::Ambiguous { keys } => Kind::CoverageAmbiguous {
+                    keys: keys.iter().map(|key| (*key).to_string()).collect(),
+                },
+                join::Caveat::Contested { key, claimants } => Kind::CoverageContested {
+                    key: key.to_string(),
+                    claimants: claimants.to_vec(),
+                },
+                join::Caveat::Superseded { key, winner } => Kind::CoverageSuperseded {
+                    key: key.to_string(),
+                    winner: winner.to_string(),
                 },
             };
-            Some(Diagnostic::run(Site::file(file), kind))
+            Some(Diagnostic::run(Site::file(&file.file), kind))
         })
         .collect()
 }
@@ -408,7 +480,18 @@ mod tests {
             lcov_path.map(PathBuf::from),
             test_command,
             &[],
+            Format::Table,
         )
+    }
+
+    /// A joined file with no functions: these tests are about the file's
+    /// *attribution*, which is a per-file fact whatever it scored.
+    fn attributed<'a>(file: &str, attribution: join::Attribution<'a>) -> JoinedFile<'a> {
+        JoinedFile {
+            file: file.to_string(),
+            attribution,
+            functions: Vec::new(),
+        }
     }
 
     /// Rendered form of each diagnostic — what stderr would show.
@@ -568,8 +651,8 @@ mod tests {
 
     #[test]
     fn exact_resolutions_produce_no_diagnostics() {
-        let diags = attribution_diagnostics(&[(
-            "src/lib.rs".to_string(),
+        let diags = attribution_diagnostics(&[attributed(
+            "src/lib.rs",
             join::Attribution::Resolved(coverage::Resolution::Exact("src/lib.rs")),
         )]);
         assert!(diags.is_empty(), "{diags:?}");
@@ -578,18 +661,18 @@ mod tests {
     #[test]
     fn suffix_and_unresolved_resolutions_produce_one_diagnostic_each() {
         let diags = rendered(&attribution_diagnostics(&[
-            (
-                "src/lib.rs".to_string(),
+            attributed(
+                "src/lib.rs",
                 join::Attribution::Resolved(coverage::Resolution::Exact("src/lib.rs")),
             ),
-            (
-                "src/fuzzy.rs".to_string(),
+            attributed(
+                "src/fuzzy.rs",
                 join::Attribution::Resolved(coverage::Resolution::Suffix(
                     "crates/demo/src/fuzzy.rs",
                 )),
             ),
-            (
-                "src/gone.rs".to_string(),
+            attributed(
+                "src/gone.rs",
                 join::Attribution::Resolved(coverage::Resolution::Unresolved),
             ),
         ]));
@@ -610,8 +693,8 @@ mod tests {
     /// lie, the record exists and belongs to a named file.
     #[test]
     fn a_superseded_claim_names_the_record_and_its_winner() {
-        let diags = rendered(&attribution_diagnostics(&[(
-            "crates/beta/src/lib.rs".to_string(),
+        let diags = rendered(&attribution_diagnostics(&[attributed(
+            "crates/beta/src/lib.rs",
             join::Attribution::Superseded {
                 key: "src/lib.rs",
                 winner: "src/lib.rs".to_string(),
@@ -633,8 +716,8 @@ mod tests {
     /// than no warning, so the diagnostic names every tied candidate.
     #[test]
     fn an_ambiguous_resolution_names_the_tied_candidates() {
-        let diags = rendered(&attribution_diagnostics(&[(
-            "src/lib.rs".to_string(),
+        let diags = rendered(&attribution_diagnostics(&[attributed(
+            "src/lib.rs",
             join::Attribution::Resolved(coverage::Resolution::Ambiguous(vec![
                 "crates/alpha/src/lib.rs",
                 "crates/beta/src/lib.rs",
@@ -658,15 +741,15 @@ mod tests {
             "crates/beta/src/lib.rs".to_string(),
         ];
         let diags = rendered(&attribution_diagnostics(&[
-            (
-                "src/lib.rs".to_string(),
+            attributed(
+                "src/lib.rs",
                 join::Attribution::Collision {
                     key: "src/lib.rs",
                     sources: sources.clone(),
                 },
             ),
-            (
-                "crates/beta/src/lib.rs".to_string(),
+            attributed(
+                "crates/beta/src/lib.rs",
                 join::Attribution::Collision {
                     key: "src/lib.rs",
                     sources,

@@ -152,6 +152,9 @@ pub(crate) enum Kind {
 impl Kind {
     /// Stable machine identifier, independent of the rendered wording. Carried
     /// so T11's `warnings[]` has something to key on that is not prose.
+    ///
+    /// **Append-only, never renamed** (C24): every string here is emitted in
+    /// the frozen JSON document and byte-locked by the JSON reporter's tests.
     fn code(&self) -> &'static str {
         match self {
             Self::IgnoredTestCommand => "ignored-test-command",
@@ -262,15 +265,13 @@ impl fmt::Display for Kind {
 /// Public only because the binary crate drains the sink and prints it; the
 /// fields stay crate-private, so the public surface is exactly `Display`.
 pub struct Diagnostic {
-    /// Stable machine identifier for [`kind`](Self::kind), for T11's
-    /// `warnings[]` (FC-T9c). Not rendered — the human-readable form is
-    /// `Display`.
-    #[allow(dead_code)]
+    /// Stable machine identifier for [`kind`](Self::kind), keyed on by the
+    /// JSON document's `warnings[]` (C24). Not rendered — the human-readable
+    /// form is `Display`.
     pub(crate) code: &'static str,
     /// Advisory, always, today (C6).
     pub(crate) severity: Severity,
-    /// Config or run (FC-T8g); read by T11, which groups them.
-    #[allow(dead_code)]
+    /// Config or run (FC-T8g); emitted by the JSON reporter as `phase`.
     pub(crate) phase: Phase,
     /// Where it points, when it points somewhere.
     pub(crate) site: Option<Site>,
