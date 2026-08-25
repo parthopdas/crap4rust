@@ -75,11 +75,11 @@ numbering **stable** and update references on any insert/reorder.
 - **Pack:** `4-pack` _(role selector: `4-pack ⇒ orchestrator`, `1-pack ⇒ solo`; the `agentify` skill asks and stamps this — no default. Preflight Gate-1 **blocks** if unset, i.e. the value isn't `1-pack`/`4-pack`.)_
 - **Persona:** JARVIS _(driver skin; the `agentify` skill asks and stamps this — no default, not a preflight blocker. Menu = the overlays in `.github/personas/`, today JARVIS | FRIDAY.)_
 - **Generated artifacts (never edit):** `/target`
-- **App run/restart & liveness mechanism:** `<<FILL_ME: how to (re)start the app locally + any lifecycle/liveness signal, or "none">>`
+- **App run/restart & liveness mechanism:** `none` _(crap4rust is a batch CLI, not a long-running service — nothing to keep alive; run on demand via `cargo run -- <args>`)_
 - **Build/test skills:** `.github/skills/build-test.md` (fast, Dave) and
   `.github/skills/build-test-full.md` (full, Bhaskar) are framework-owned recipes that run the commands
   named in the **Commands** table below — fill that table in for your stack.
-- **Language-specific conventions:** `<<FILL_ME: e.g. C#: prefer least-privilege access modifiers; avoid internal unless required>>`
+- **Language-specific conventions:** Rust 2021; prefer least-privilege visibility (private by default; `pub(crate)` over `pub`; expose `pub` only across the crate boundary). Keep the CRAP domain and CC engine pure (no I/O) so they stay unit-testable; push I/O (fs, process, git) to the edges. No `unsafe`. Idiomatic error handling with `Result` + `anyhow`/`thiserror` (no `unwrap`/`expect`/`panic!` on reachable paths outside tests). `cargo fmt` + `cargo clippy -D warnings` must stay clean.
 - **CI/CD pipeline:** `GitHub Actions - .github/workflows/ci.yml (fmt + clippy + build + test on ubuntu-latest & windows-latest). Agents never deploy.`
 
 ### Commands

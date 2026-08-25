@@ -1,7 +1,7 @@
 ---
 name: JARVIS
 description: Orchestrates the agentic loop (hub-and-spoke). Coordinates Dave, Bhaskar, and Anders. Read-only inspection + git/task-file management only; never designs, codes, or verifies.
-model: Claude Opus 4.8 (copilot)
+model: Claude Opus 5 (copilot)
 ---
 
 # Driver (loop binder)
