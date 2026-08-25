@@ -45,14 +45,14 @@
 //! dependencies (`--no-deps` resolves nothing, so there is no network or
 //! registry access — golden rule #8).
 //!
-//! **Scope.** `#[cfg(test)]`/`#[test]` item filtering and the positional
-//! path-fragment filters are T10 (C5) and are deliberately not pre-built here.
-//! In particular a `#[cfg(test)] mod tests;` declaration *is* followed: loading
-//! a declared module is module-graph resolution (this task), while deciding
-//! that its contents are test code and dropping them is filtering (T10). Doing
-//! the cfg evaluation here would both pull T10 forward and be wrong on its own
-//! terms — a `#[cfg(feature = "x")] mod` is product source under one feature
-//! set and not under another, and we do not know the feature set.
+//! **Scope.** Product-vs-test filtering is T10 (C5) and is split by what each
+//! part can see: a test-only `mod` declaration is skipped by the graph walk
+//! ([`modgraph`]), test items are skipped by the CC engine, and which *files*
+//! the user asked about is the CLI edge's call ([`crate::cli`]) — enumeration
+//! itself still answers "what does cargo build", unnarrowed. Skipping a
+//! `#[cfg(test)] mod tests;` is the one cfg evaluation the walk does, and it is
+//! not the general case: a `#[cfg(feature = "x")] mod` is product source under
+//! one feature set and not under another, and we do not know the feature set.
 
 mod modgraph;
 
@@ -73,8 +73,9 @@ pub(crate) struct SourceFile<'a> {
     /// Crate-qualified module path for the file (C3), e.g. `demo::foo::bar`.
     pub(crate) module: String,
     /// The file's path relative to the workspace root, forward-slashed. This is
-    /// the path the file is *known by*: it is what the coverage join queries
-    /// and what the identity fields (C15) carry.
+    /// the path the file is *known by*: the identity fields (C15) carry it, the
+    /// diagnostics name it, and the coverage join derives its LCOV query from
+    /// it (FC-T9e).
     pub(crate) path: String,
     /// The file's AST, parsed once by the walk that found it (FC-T9h).
     pub(crate) ast: &'a syn::File,
@@ -231,7 +232,13 @@ fn source_files(
 }
 
 /// `file` as a forward-slashed path **relative** to the workspace root — the
-/// key the coverage join queries by and the C15 identity `file` (FC-T7a).
+/// C15 identity `file`, and the path every diagnostic and report row names it
+/// by (FC-T7a).
+///
+/// This is the **display identity**, not the LCOV query key: a member above the
+/// root gets `..` segments, which no absolute LCOV key can end with, so the
+/// join derives its own query from this string rather than using it as one
+/// (FC-T9e — see [`crate::join`]).
 ///
 /// A member outside the workspace root (a path dependency above it) gets a
 /// lexical relative path with `..` segments. An absolute path — a drive letter
@@ -239,6 +246,14 @@ fn source_files(
 /// so when the two paths share no prefix at all (different Windows drives, the
 /// only case with no relative form) the path's root/prefix components are
 /// dropped instead.
+///
+/// **Known limit (FC-T9e), documented rather than fixed:** that last case
+/// yields `other/src/lib.rs` for `D:\other\src\lib.rs`, which is
+/// indistinguishable from a real member at `<root>/other/src/lib.rs`. Two
+/// members could then collide on one identity. Every alternative either leaks
+/// an absolute path into the report (D2) or invents an escape spelling that is
+/// no longer a path; the case needs a workspace spanning two Windows drives,
+/// and the join's collision guard reports rather than guesses if it happens.
 pub(super) fn workspace_relative(workspace_root: &Path, file: &Path) -> String {
     let root: Vec<Component> = workspace_root.components().collect();
     let target: Vec<Component> = file.components().collect();

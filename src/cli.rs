@@ -21,20 +21,35 @@
 //! the path each file is known by all come from there (FC-T7d). Coverage is
 //! generated **once per invocation** and discovery runs per member: `cargo
 //! llvm-cov` is workspace-aware, so there is exactly one artifact and no root
-//! can clobber another's (FC-T8e). Product-vs-test filtering is still T10.
+//! can clobber another's (FC-T8e).
+//!
+//! **T10 surface.** What counts as product source (C5) is decided in two
+//! places, each where it can see what it needs: test *items* are skipped by the
+//! CC engine ([`crate::product`] via [`crate::complexity`]), and test-only
+//! `mod` declarations — and whole test-only files, subtree and all — are
+//! skipped by the module-graph walk, which is where descent is decided
+//! (FC-T9g). Only `--filter` selection happens here — and only on **rows**:
+//! `--filter` narrows the report, never the analysis (C26), so the join sees
+//! every discovered unit and a file's numbers are the same filtered and
+//! unfiltered. Diagnostics are the exception that proves it: they *are* scoped
+//! to the filters, because each is about one file, while attribution is settled
+//! across the whole join.
 //! There is no `--threshold`: v1 is a reporter, not a gate (C6/C11/D1).
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
 
 use crate::diagnostic::{Kind, Site};
+use crate::filter::Filters;
 use crate::join::SourceUnit;
 use crate::runner::CoverageSource;
 use crate::{complexity, coverage, join, report, workspace};
 
-/// `crap4rust [--lcov-path <PATH>] [--test-command <COMMAND>] <PATH>`.
+/// `crap4rust [--lcov-path <PATH>] [--test-command <COMMAND>] [--filter
+/// <FRAGMENT>]... <PATH>`.
 #[derive(Parser)]
 #[command(name = "crap4rust", version, about, long_about = None)]
 pub struct Cli {
@@ -60,11 +75,26 @@ pub struct Cli {
     #[arg(long, value_name = "COMMAND")]
     test_command: Option<String>,
 
+    /// Only report source files whose path contains this fragment. Repeatable.
+    ///
+    /// A fragment matches by whole path segments against the workspace-relative
+    /// path, so `--filter crates/alpha` selects `crates/alpha/src/lib.rs` but
+    /// not `crates/alpha-utils/src/lib.rs`. Several are alternatives: a file is
+    /// reported if **any** of them matches it. Matching is case-sensitive on
+    /// every platform.
+    ///
+    /// This is deliberately *not* the positional `PATH` (FC-T9j): that argument
+    /// locates the workspace, and a locator and a filter are different kinds of
+    /// thing that clap cannot tell apart positionally.
+    #[arg(long, value_name = "FRAGMENT")]
+    filter: Vec<String>,
+
     /// A path inside the cargo workspace to analyse.
     ///
     /// Only used to find the workspace: cargo searches this path and its
     /// ancestors for the manifest, and every member of the workspace it finds
-    /// is analysed (C3/A3).
+    /// is analysed (C3/A3). It narrows nothing — use `--filter` for that
+    /// (FC-T9j).
     #[arg(value_name = "PATH")]
     path: PathBuf,
 }
@@ -80,6 +110,8 @@ pub struct RunConfig {
     diagnostics: Vec<Diagnostic>,
     /// A path inside the cargo workspace to analyse.
     path: PathBuf,
+    /// Which files reach the report (C5). Empty means all of them.
+    filters: Filters,
 }
 
 impl RunConfig {
@@ -88,12 +120,18 @@ impl RunConfig {
     /// Where coverage comes from — including `--lcov-path` winning outright
     /// over `--test-command` — is the coverage adapter's own policy, so it is
     /// resolved by [`CoverageSource::resolve`] rather than restated here.
-    pub fn new(path: PathBuf, lcov_path: Option<PathBuf>, test_command: Option<&str>) -> Self {
+    pub fn new(
+        path: PathBuf,
+        lcov_path: Option<PathBuf>,
+        test_command: Option<&str>,
+        filters: &[String],
+    ) -> Self {
         let (coverage, diagnostics) = CoverageSource::resolve(lcov_path, test_command);
         Self {
             coverage,
             diagnostics,
             path,
+            filters: Filters::new(filters),
         }
     }
 
@@ -114,6 +152,7 @@ impl From<&Cli> for RunConfig {
             cli.path.clone(),
             cli.lcov_path.clone(),
             cli.test_command.as_deref(),
+            &cli.filter,
         )
     }
 }
@@ -122,15 +161,56 @@ impl From<&Cli> for RunConfig {
 /// (FC-T9d). Only [`Display`](std::fmt::Display) is public on it.
 pub use crate::diagnostic::Diagnostic;
 
-/// Trailing stdout notice when discovery declined work (C18).
+/// The trailing **report-caveats block** — everything stdout has to say about
+/// the report *as an artifact*, as distinct from the rows in it (C18/C27).
 ///
-/// The report *is* the deliverable — `crap4rust . > report.txt` must not look
-/// complete when it is not — so the fact that modules are missing from it
-/// belongs in the artifact, not only on the stream the artifact does not
-/// capture.
-fn declined_notice(count: usize) -> String {
-    let plural = if count == 1 { "module" } else { "modules" };
-    format!("\n{count} {plural} not analysed (see stderr)\n")
+/// The report is the deliverable, so `crap4rust . > report.txt` must not look
+/// complete when it is not: a fact about the artifact belongs on the artifact,
+/// not only on the stream the artifact does not capture. There is **one** block
+/// rather than a trailer per condition because T11's JSON carries these same
+/// facts structurally (FC-T9n) and needs one shape to mirror, not an accreting
+/// pile of ad-hoc trailing strings.
+///
+/// What is deliberately **not** here: anything about the *request* rather than
+/// the artifact. An unmatched `--filter` stays stderr-only (C27) — stdout
+/// states completeness relative to what was asked for, and a fragment that
+/// matched nothing asked for nothing.
+struct Caveats {
+    /// Rows in the report. Zero is a caveat in its own right (C27), and gets
+    /// the same line whatever caused it — a typo'd filter, an over-narrow one,
+    /// a workspace that is all test code, or a genuinely empty crate — because
+    /// the reader's problem, an empty artifact indistinguishable from a clean
+    /// one, is the same in every case.
+    rows: usize,
+    /// How many **distinct modules** discovery declined to analyse (C18/C22).
+    /// A lower bound: one declined `cfg_attr` path drops a subtree of unknown
+    /// size.
+    declined: usize,
+}
+
+impl Caveats {
+    /// The block to append to the rendered report, or `""` when the report has
+    /// nothing to caveat — so the happy path's bytes are exactly C14's table.
+    fn render(&self) -> String {
+        let mut lines = Vec::new();
+        if self.rows == 0 {
+            lines.push("no functions reported".to_string());
+        }
+        if self.declined > 0 {
+            let plural = if self.declined == 1 {
+                "module"
+            } else {
+                "modules"
+            };
+            let count = self.declined;
+            lines.push(format!("{count} {plural} not analysed (see stderr)"));
+        }
+        if lines.is_empty() {
+            String::new()
+        } else {
+            format!("\n{}\n", lines.join("\n"))
+        }
+    }
 }
 
 /// Run the pipeline and return the rendered "CRAP Report" (C14).
@@ -154,11 +234,24 @@ pub fn run(config: &RunConfig, diagnostics: &mut Vec<Diagnostic>) -> anyhow::Res
 
     // Discovery diagnostics come first: a declared module the graph could not
     // reach explains why a file is missing from everything that follows.
-    let declined_before = declined(diagnostics);
+    let discovered = diagnostics.len();
     let mut units = Vec::new();
+    let mut selected = BTreeSet::new();
+    let mut matched = BTreeSet::new();
     // Discovery streams each file's AST as it parses it, so each file is read
     // and parsed exactly once, and only one AST is alive at a time (FC-T9h).
     workspace::discover(&config.path, diagnostics, &mut |source| {
+        // C26: **every** discovered unit reaches the join, selected or not.
+        // The join settles attribution over the whole claim map (C19), so a
+        // unit missing from it changes the numbers of the units that remain —
+        // a suffix claimant whose exact claimant was filtered away would
+        // silently inherit the record and be scored from it. Selection is
+        // folded here as a per-file fact and applied to rows *after* the join.
+        let selection = config.filters.select(&source.path);
+        matched.extend(selection.matched());
+        if selection.is_selected() {
+            selected.insert(source.path.clone());
+        }
         units.push(SourceUnit {
             module: source.module,
             path: source.path,
@@ -166,24 +259,99 @@ pub fn run(config: &RunConfig, diagnostics: &mut Vec<Diagnostic>) -> anyhow::Res
         });
         Ok(())
     })?;
-    let declined = declined(diagnostics) - declined_before;
+    scope_to_filters(&config.filters, diagnostics, discovered);
+    let declined = declined(&diagnostics[discovered..]);
 
     let joined = join::join(&lcov, &units);
-    diagnostics.extend(attribution_diagnostics(&joined.attributions));
+    let functions = retain_selected(joined.functions, &selected, |f| &f.file);
+    let attributions = retain_selected(joined.attributions, &selected, |(file, _)| file);
+    diagnostics.extend(attribution_diagnostics(&attributions));
+    diagnostics.extend(
+        config
+            .filters
+            .unmatched(&matched)
+            .into_iter()
+            .map(|filter| {
+                Diagnostic::global(Kind::FilterMatchedNothing {
+                    filter: filter.to_string(),
+                })
+            }),
+    );
 
-    let mut report = report::format_report(&report::rows_from_joined(&joined.functions));
-    if declined > 0 {
-        report.push_str(&declined_notice(declined));
-    }
+    let rows = report::rows_from_joined(&functions);
+    let mut report = report::format_report(&rows);
+    report.push_str(
+        &Caveats {
+            rows: rows.len(),
+            declined,
+        }
+        .render(),
+    );
     Ok(report)
 }
 
-/// How many diagnostics so far report work the tool declined (C18).
+/// Drop everything the filters did not select, keeping the rest in order.
+///
+/// This is the second half of C26 and the only place selection is *applied*:
+/// the join above ran over the whole workspace, so every value here was
+/// computed as if no filter had been given.
+fn retain_selected<T>(
+    items: Vec<T>,
+    selected: &BTreeSet<String>,
+    file_of: impl Fn(&T) -> &String,
+) -> Vec<T> {
+    items
+        .into_iter()
+        .filter(|item| selected.contains(file_of(item)))
+        .collect()
+}
+
+/// Drop discovery diagnostics about files the filters did not select.
+///
+/// A diagnostic has to agree with the report it trails: complaining that a
+/// module of `crates/beta` could not be resolved, under a report that was
+/// explicitly narrowed to `crates/alpha`, is noise — and worse, it would be
+/// counted by the C18 notice on an artifact that never claimed to cover it.
+/// Diagnostics with no site are about the run as a whole and always stay.
+///
+/// Diagnostics are scoped; **numbers are not** (C26). Narrowing the run's
+/// *voice* is safe because a diagnostic is about one file; narrowing the
+/// *analysis* is not, because attribution is settled across the whole join.
+///
+/// **Source units are authoritative for whether a fragment matched anything.**
+/// The selections made here are deliberately discarded rather than folded into
+/// the run's matched set, so a fragment selecting only a file that produced a
+/// diagnostic but no unit — an unparseable file, say — still reports "matched
+/// no source file". That is exactly what happened: keeping its diagnostic is
+/// *scoping* (the user asked about that code), not evidence that the fragment
+/// selected anything to report.
+fn scope_to_filters(filters: &Filters, diagnostics: &mut Vec<Diagnostic>, from: usize) {
+    if filters.is_empty() {
+        return;
+    }
+    let mut scoped = diagnostics.split_off(from);
+    scoped.retain(|diagnostic| {
+        diagnostic
+            .site
+            .as_ref()
+            .is_none_or(|site| filters.select(&site.file).is_selected())
+    });
+    diagnostics.append(&mut scoped);
+}
+
+/// How many **distinct modules** the diagnostics report the tool declined to
+/// analyse (C18/C22).
+///
+/// Deduped by module path, not counted per diagnostic: two cfg-guarded
+/// declarations of one module are two lines worth printing but one module
+/// missing from the report, and the number on the artifact is a count of
+/// missing modules.
 fn declined(diagnostics: &[Diagnostic]) -> usize {
     diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.kind.declines_analysis())
-        .count()
+        .filter_map(|diagnostic| diagnostic.kind.declined_module())
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 /// Render the join's per-file attributions (FC-T5b) as diagnostics.
@@ -239,6 +407,7 @@ mod tests {
             PathBuf::from(path),
             lcov_path.map(PathBuf::from),
             test_command,
+            &[],
         )
     }
 
@@ -257,6 +426,33 @@ mod tests {
         assert_eq!(from_parser.coverage, from_plain.coverage);
         assert_eq!(from_parser.diagnostics, from_plain.diagnostics);
         assert_eq!(from_parser.path, from_plain.path);
+        assert_eq!(from_parser.filters, from_plain.filters);
+    }
+
+    /// FC-T9j: the positional argument locates the workspace and nothing else.
+    /// Filters are a repeatable flag, because a locator and a filter are
+    /// different kinds of thing and clap cannot tell them apart positionally —
+    /// `crap4rust crates/alpha crates/beta` reading as "locate at alpha, filter
+    /// to beta" is indefensible, so a second positional is simply an error.
+    #[test]
+    fn filters_are_a_repeatable_flag_not_the_positional() {
+        let cli = Cli::parse_from([
+            "crap4rust",
+            "--filter",
+            "crates/alpha",
+            "--filter",
+            "crates/beta",
+            ".",
+        ]);
+        let resolved = RunConfig::from(&cli);
+        assert_eq!(resolved.path, PathBuf::from("."));
+        assert_eq!(
+            resolved.filters,
+            Filters::new(&["crates/alpha".to_string(), "crates/beta".to_string()])
+        );
+
+        assert!(Cli::try_parse_from(["crap4rust", "crates/alpha", "crates/beta"]).is_err());
+        assert!(config("crates/alpha", None, None).filters.is_empty());
     }
 
     /// C18: the notice is a fact about the *artifact*, so it is on the artifact
@@ -264,10 +460,40 @@ mod tests {
     /// complete one. One module is not "1 modules".
     #[test]
     fn the_declined_notice_agrees_with_itself_in_number() {
-        assert_eq!(declined_notice(1), "\n1 module not analysed (see stderr)\n");
+        let declined = |declined| Caveats { rows: 1, declined }.render();
+        assert_eq!(declined(1), "\n1 module not analysed (see stderr)\n");
+        assert_eq!(declined(3), "\n3 modules not analysed (see stderr)\n");
+    }
+
+    /// C27: an empty report says so on the artifact, in one shape, whatever
+    /// emptied it — and a complete, non-empty report says nothing at all, so
+    /// the happy path is byte-for-byte C14's table.
+    #[test]
+    fn the_caveats_block_is_one_block_and_is_empty_when_there_is_nothing_to_say() {
         assert_eq!(
-            declined_notice(3),
-            "\n3 modules not analysed (see stderr)\n"
+            Caveats {
+                rows: 0,
+                declined: 0
+            }
+            .render(),
+            "\nno functions reported\n"
+        );
+        // Both conditions at once are one block, not two trailers (FC-T9n).
+        assert_eq!(
+            Caveats {
+                rows: 0,
+                declined: 2
+            }
+            .render(),
+            "\nno functions reported\n2 modules not analysed (see stderr)\n"
+        );
+        assert_eq!(
+            Caveats {
+                rows: 3,
+                declined: 0
+            }
+            .render(),
+            ""
         );
     }
 
@@ -286,6 +512,58 @@ mod tests {
             Diagnostic::run(Site::file("src/lib.rs"), Kind::CoverageAbsent),
         ];
         assert_eq!(declined(&diagnostics), 1);
+    }
+
+    /// C22: the notice counts **distinct modules**, not diagnostics. Two
+    /// mutually exclusive declarations of one module are two lines on stderr —
+    /// both worth printing, they name different sites — but exactly one module
+    /// missing from the report, and the artifact says how many *modules*.
+    #[test]
+    fn two_declarations_of_one_module_are_one_declined_module() {
+        let missing = |line| {
+            Diagnostic::run(
+                Site::at("src/lib.rs", line, 1),
+                Kind::ModuleFileMissing {
+                    module: "demo::imp".to_string(),
+                    candidates: Vec::new(),
+                },
+            )
+        };
+        let diagnostics = vec![missing(2), missing(5)];
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(declined(&diagnostics), 1);
+    }
+
+    /// A narrowed report must not trail diagnostics about code it never
+    /// claimed to cover — and those diagnostics must not be counted by the C18
+    /// notice on it either. A site-less diagnostic is about the run as a whole
+    /// and stays regardless.
+    #[test]
+    fn filtered_out_files_take_their_diagnostics_with_them() {
+        let mut diagnostics = vec![
+            Diagnostic::run(Site::file("crates/alpha/src/lib.rs"), Kind::CoverageAbsent),
+            Diagnostic::run(
+                Site::at("crates/beta/src/lib.rs", 1, 1),
+                Kind::ModuleFileMissing {
+                    module: "beta::absent".to_string(),
+                    candidates: Vec::new(),
+                },
+            ),
+            Diagnostic::global(Kind::FilterMatchedNothing {
+                filter: "crates/gone".to_string(),
+            }),
+        ];
+
+        scope_to_filters(
+            &Filters::new(&["crates/alpha".to_string()]),
+            &mut diagnostics,
+            0,
+        );
+
+        assert_eq!(diagnostics.len(), 2, "{:?}", rendered(&diagnostics));
+        assert!(diagnostics[0].to_string().contains("crates/alpha"));
+        assert!(diagnostics[1].to_string().contains("crates/gone"));
+        assert_eq!(declined(&diagnostics), 0);
     }
 
     #[test]

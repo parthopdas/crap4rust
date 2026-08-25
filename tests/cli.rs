@@ -10,7 +10,9 @@
 //! no external tooling (`cargo metadata --no-deps` resolves nothing, and no
 //! test ever invokes a real `cargo llvm-cov`, FC-T8b).
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -82,17 +84,51 @@ DA:13,1
 end_of_record
 ";
 
+/// An isolated fixture directory that deletes itself when the test ends.
+///
+/// Cleanup is a [`Drop`], so it also runs when an assertion panics — the same
+/// bar the unit-test tree harness meets. Without it a full run leaves one
+/// directory per test behind under the cargo target directory, on both CI
+/// runners; on Windows a leaked directory is also a leaked handle waiting to
+/// fail the *next* run's `remove_dir_all`. The process id in the name keeps two
+/// concurrent copies of this suite off each other's fixtures.
+struct Fixture(PathBuf);
+
+impl Fixture {
+    /// A freshly created, empty fixture root named after the test.
+    fn new(name: &str) -> Self {
+        let dir =
+            Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create fixture root");
+        Self(dir)
+    }
+}
+
+impl Deref for Fixture {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Create an isolated fixture directory containing a minimal cargo package
-/// (`Cargo.toml` + `src/lib.rs`) and `coverage.lcov`, and return its path.
+/// (`Cargo.toml` + `src/lib.rs`) and `coverage.lcov`.
 ///
 /// The manifest is what makes this a workspace cargo metadata can resolve (A3):
 /// it declares its own `[workspace]`, so the fixture is self-contained rather
 /// than being drawn into whatever workspace encloses the target directory, and
 /// it has **no dependencies**, so `cargo metadata --no-deps` resolves nothing
 /// and touches no registry or network.
-fn fixture(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
+fn fixture(name: &str) -> Fixture {
+    let dir = Fixture::new(name);
     fs::create_dir_all(dir.join("src")).expect("create fixture dir");
     fs::write(dir.join("Cargo.toml"), manifest("demo")).expect("write fixture manifest");
     fs::write(dir.join("src").join("lib.rs"), SOURCE).expect("write fixture source");
@@ -564,9 +600,8 @@ fn beta_one() -> i32 {
 /// under `crates/`. Both members have a `src/lib.rs` — the filename collision
 /// that is guaranteed in any real workspace and that S1 was immune to only
 /// because it analysed a single crate.
-fn workspace_fixture(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
+fn workspace_fixture(name: &str) -> Fixture {
+    let dir = Fixture::new(name);
     let beta = dir.join("crates").join("beta");
     fs::create_dir_all(dir.join("src")).expect("create root src");
     fs::create_dir_all(beta.join("src")).expect("create member src");
@@ -781,9 +816,8 @@ beta_one                       beta                                   1    N/A  
 /// target name that is not the package name, a `#[path]`-relocated module, and
 /// two kinds of file no crate root reaches — one beside a library root, one in
 /// a package that has no library at all.
-fn multi_target_fixture(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
+fn multi_target_fixture(name: &str) -> Fixture {
+    let dir = Fixture::new(name);
     let solo = dir.join("crates").join("solo");
     fs::create_dir_all(dir.join("src").join("bin")).expect("create root src/bin");
     fs::create_dir_all(dir.join("cmd")).expect("create root cmd");
@@ -907,9 +941,8 @@ tool_one                       tool                                   1  100.0% 
 
 /// Two packages naming the *same* file as a target root — which cargo permits,
 /// since a target's `path` may point outside its package.
-fn shared_source_fixture(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&dir);
+fn shared_source_fixture(name: &str) -> Fixture {
+    let dir = Fixture::new(name);
     let beta = dir.join("crates").join("beta");
     fs::create_dir_all(dir.join("src")).expect("create root src");
     fs::create_dir_all(dir.join("shared")).expect("create shared dir");
@@ -1157,8 +1190,7 @@ fn a_source_outside_the_workspace_root_is_reported_by_a_relative_path() {
     // produces — must still be known by a *relative* path. An absolute path — a
     // drive letter on Windows, a build-machine path anywhere — must never reach
     // the identity the join queries by and the report carries.
-    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join("external_source");
-    let _ = fs::remove_dir_all(&base);
+    let base = Fixture::new("external_source");
     let root = base.join("workspace");
     fs::create_dir_all(root.join("src")).expect("create root src");
     fs::create_dir_all(base.join("shared")).expect("create external dir");
@@ -1212,4 +1244,724 @@ fn a_source_outside_the_workspace_root_is_reported_by_a_relative_path() {
         !external_line.contains(" /"),
         "an absolute path leaked: {external_line}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// T10 — product-vs-test filtering (C5), unit-level drops (FC-T9g), the C22
+// dedupe, the `--filter` surface (FC-T9j) and the query key (FC-T9e).
+// ---------------------------------------------------------------------------
+
+/// A workspace with a **virtual** root manifest and two members side by side,
+/// so neither sits at the workspace root and both are known by a four-segment
+/// path — the shape that makes one short LCOV key claimable by both.
+fn members_fixture(name: &str, alpha: &str, beta: &str) -> Fixture {
+    let dir = Fixture::new(name);
+    for (member, source) in [("alpha", alpha), ("beta", beta)] {
+        let crate_dir = dir.join("crates").join(member);
+        fs::create_dir_all(crate_dir.join("src")).expect("create member src");
+        fs::write(crate_dir.join("Cargo.toml"), manifest_member(member))
+            .expect("write member manifest");
+        fs::write(crate_dir.join("src").join("lib.rs"), source).expect("write member source");
+    }
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/alpha\", \"crates/beta\"]\nresolver = \"2\"\n",
+    )
+    .expect("write virtual workspace manifest");
+    dir
+}
+
+/// Everything a normal build never compiles, in one file: a `#[test]` function,
+/// a test-only module, and the helpers inside it.
+const TEST_HEAVY_SOURCE: &str = "\
+fn kept() -> i32 {
+    1
+}
+
+#[test]
+fn a_test() {
+    assert_eq!(kept(), 1);
+}
+
+#[cfg(test)]
+mod tests {
+    fn helper() -> i32 {
+        2
+    }
+
+    #[test]
+    fn another_test() {
+        assert_eq!(helper(), 2);
+    }
+}
+";
+
+#[test]
+fn test_items_are_excluded_from_the_report() {
+    // C5: `cargo test` compiles these, `cargo build` never does, so they are
+    // not the product whose risk is being reported. A test module goes whole —
+    // its helpers are as much test code as the `#[test]`s beside them. The
+    // whole table is asserted, because "which rows exist" is the entire point.
+    let dir = fixture("test_items");
+    fs::write(dir.join("src").join("lib.rs"), TEST_HEAVY_SOURCE).expect("write source");
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:src/lib.rs\nDA:2,1\nend_of_record\n",
+    )
+    .expect("write lcov");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        "\
+CRAP Report
+===========
+Function                       Module                                CC    Cov%     CRAP
+----------------------------------------------------------------------------------------
+kept                           demo                                   1  100.0%      1.0
+"
+    );
+    assert_eq!(stderr_of(&out), "");
+}
+
+#[test]
+fn a_test_only_module_declaration_is_never_resolved() {
+    // FC-T9g: `#[cfg(test)] mod tests;` names a file that is not product
+    // source, so the graph must not even look for it. Resolved, its absence
+    // would be a **declined module** — a warning about code we were never going
+    // to measure, and a count on the artifact itself (C18) telling the reader
+    // the report is incomplete when it is not.
+    let dir = fixture("cfg_test_declaration");
+    fs::write(
+        dir.join("src").join("lib.rs"),
+        format!("#[cfg(test)]\nmod tests;\n\n{SOURCE}"),
+    )
+    .expect("write source declaring a test module");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("covered"), "{stdout}");
+    assert!(stdout.contains("risky"), "{stdout}");
+    assert!(!stdout.contains("not analysed"), "{stdout}");
+    assert_eq!(stderr_of(&out), "");
+}
+
+#[test]
+fn a_wholly_test_file_stakes_no_claim_on_a_coverage_record() {
+    // FC-T9g, the expensive half: `crates/beta/src/lib.rs` is nothing but test
+    // code, so it has no rows — but as a *unit* it still claimed an LCOV key,
+    // and one short key claimed by two files with no exact claimant is a
+    // collision (C19) that N/As **both**. A file with nothing to report was
+    // therefore silently deleting a real file's numbers. Dropping the empty
+    // unit before the join is what makes alpha's coverage reappear.
+    let dir = members_fixture(
+        "empty_unit_claim",
+        ALPHA_SOURCE,
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n",
+    );
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:src/lib.rs\nDA:2,1\nend_of_record\n",
+    )
+    .expect("write single-record lcov");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        "\
+CRAP Report
+===========
+Function                       Module                                CC    Cov%     CRAP
+----------------------------------------------------------------------------------------
+alpha_one                      alpha                                  2  100.0%      2.0
+"
+    );
+    // Only the suffix match is worth saying: nothing is contested any more, and
+    // beta is not diagnosed for a coverage match it has no rows to use.
+    let stderr = stderr_of(&out);
+    assert_eq!(stderr.lines().count(), 1, "stderr: {stderr}");
+    assert!(stderr.contains("crates/alpha/src/lib.rs"), "{stderr}");
+    assert!(stderr.contains("suffix match"), "{stderr}");
+}
+
+#[test]
+fn a_test_only_file_hides_the_modules_it_declares() {
+    // FC-T9g, the descendant half: `#![cfg(test)]` makes the file *and its
+    // subtree* absent from a normal build. Dropping only the resulting unit is
+    // too late — `harness`'s child was already resolved by then, so its
+    // apparently-product `helper` was measured, reported, and staked a claim on
+    // beta's coverage record. Here that claim is the one that matters: with the
+    // child measured, `crates/beta/src/harness/child.rs` contests nothing but
+    // `helper` appears in a report of the product, for a module the product
+    // does not contain.
+    let dir = members_fixture("cfg_test_file_child", ALPHA_SOURCE, "mod harness;\n");
+    let harness = dir.join("crates").join("beta").join("src");
+    fs::create_dir_all(harness.join("harness")).expect("create harness dir");
+    fs::write(harness.join("harness.rs"), "#![cfg(test)]\nmod child;\n")
+        .expect("write test-only file");
+    fs::write(
+        harness.join("harness").join("child.rs"),
+        "fn helper(x: i32) -> i32 {\n    if x > 0 { 1 } else { 0 }\n}\n",
+    )
+    .expect("write child source");
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:crates/alpha/src/lib.rs\nDA:2,1\nend_of_record\n",
+    )
+    .expect("write lcov");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        "\
+CRAP Report
+===========
+Function                       Module                                CC    Cov%     CRAP
+----------------------------------------------------------------------------------------
+alpha_one                      alpha                                  2  100.0%      2.0
+"
+    );
+    assert_eq!(
+        stderr_of(&out),
+        // beta is a product unit with no coverage record of its own — the
+        // ordinary C19 line. What must *not* be there is a word about
+        // `harness` or the `child` it declares.
+        "warning: crates/beta/src/lib.rs: absent from the coverage profile; \
+         its functions report N/A\n"
+    );
+}
+
+#[test]
+fn a_test_only_file_declaring_a_missing_module_declines_nothing() {
+    // The same descent, with the child *absent* — the case that put a wrong
+    // number on the artifact. `child.rs` is a test file someone deleted, or one
+    // that only exists behind another cfg; either way a non-test build compiles
+    // neither it nor its declaration, so there is nothing to warn about and
+    // nothing for the C18 notice to count.
+    let dir = fixture("cfg_test_file_missing_child");
+    fs::write(
+        dir.join("src").join("lib.rs"),
+        format!("mod harness;\n\n{SOURCE}"),
+    )
+    .expect("write source declaring the harness");
+    fs::write(
+        dir.join("src").join("harness.rs"),
+        "#![cfg(test)]\nmod child;\n",
+    )
+    .expect("write test-only file declaring a missing module");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("covered"), "{stdout}");
+    assert!(!stdout.contains("not analysed"), "{stdout}");
+    assert!(!stdout.contains("helper"), "{stdout}");
+    assert_eq!(stderr_of(&out), "");
+}
+
+#[test]
+fn a_constant_only_product_unit_still_stakes_its_claim() {
+    // FC-T9g, the other half: "no measured functions" is *not* "test-only".
+    // `crates/beta/src/lib.rs` is legitimate product source that happens to
+    // declare only a constant, and both members resolve against the one short
+    // `SF:src/lib.rs`. Dropping beta for having no rows would leave alpha the
+    // sole claimant of a record that may well describe beta — silently
+    // reinstating the many-to-one misattribution T9 fixed. Contested, alpha
+    // reports N/A and says why.
+    let dir = members_fixture(
+        "constant_only_unit",
+        ALPHA_SOURCE,
+        "pub const LIMIT: u32 = 3;\n",
+    );
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:src/lib.rs\nDA:2,1\nend_of_record\n",
+    )
+    .expect("write single-record lcov");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        "\
+CRAP Report
+===========
+Function                       Module                                CC    Cov%     CRAP
+----------------------------------------------------------------------------------------
+alpha_one                      alpha                                  2    N/A       N/A
+"
+    );
+    // The contest is named, and both claimants with it: which mapping is wrong
+    // is what the reader has to fix.
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("crates/alpha/src/lib.rs"), "{stderr}");
+    assert!(stderr.contains("crates/beta/src/lib.rs"), "{stderr}");
+}
+
+#[test]
+fn two_declarations_of_one_module_count_as_one_declined_module() {
+    // C22: `#[cfg(unix)] mod imp;` and `#[cfg(windows)] mod imp;` are two real
+    // declarations and each is diagnosed — a reader cannot otherwise tell which
+    // one went unresolved — but exactly **one** module is missing from the
+    // report. Counting diagnostics said "2 modules not analysed" for one
+    // module, which is a wrong number on the artifact.
+    let dir = fixture("declined_dedupe");
+    fs::write(
+        dir.join("src").join("lib.rs"),
+        format!("#[cfg(unix)]\nmod imp;\n#[cfg(windows)]\nmod imp;\n\n{SOURCE}"),
+    )
+    .expect("write doubly-declared module");
+    fs::write(dir.join("coverage.lcov"), "SF:src/lib.rs\nend_of_record\n")
+        .expect("write empty lcov");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.ends_with("\n\n1 module not analysed (see stderr)\n"),
+        "{stdout}"
+    );
+    // Both declarations are still reported: they are two conditions.
+    assert_eq!(stderr_of(&out).lines().count(), 2, "{}", stderr_of(&out));
+}
+
+#[test]
+fn tests_benches_and_examples_are_not_product_source() {
+    // C5: these are cargo targets of their own, and they are excluded where
+    // targets are enumerated — so their files are never reached, whatever they
+    // contain.
+    let dir = fixture("non_product_targets");
+    for (relative, source) in [
+        ("tests/it.rs", "fn it_one() -> i32 {\n    1\n}\n"),
+        ("benches/bench.rs", "fn bench_one() -> i32 {\n    1\n}\n"),
+        ("examples/demo.rs", "fn example_one() -> i32 {\n    1\n}\n"),
+    ] {
+        let path = dir.join(relative);
+        fs::create_dir_all(path.parent().expect("a parent")).expect("create target dir");
+        fs::write(path, source).expect("write non-product source");
+    }
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("covered"), "{stdout}");
+    for absent in ["it_one", "bench_one", "example_one"] {
+        assert!(
+            !stdout.contains(absent),
+            "{absent} is not product: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn a_filter_narrows_the_report_without_moving_the_locator() {
+    // FC-T9j: the positional locates the workspace — the whole workspace, from
+    // wherever inside it you point — and `--filter` says which of it to report.
+    // Overloading the positional as both is what this replaces: since T9,
+    // `crap4rust crates/alpha` silently analysed everything.
+    let dir = members_fixture("filter_narrows", ALPHA_SOURCE, BETA_SOURCE);
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:crates/alpha/src/lib.rs\nDA:2,1\nend_of_record\n\
+         SF:crates/beta/src/lib.rs\nDA:2,1\nend_of_record\n",
+    )
+    .expect("write per-member lcov");
+
+    let unfiltered = run_in(&dir, &["--lcov-path", "coverage.lcov", "crates/alpha"]);
+    assert_eq!(
+        unfiltered.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_of(&unfiltered)
+    );
+    let stdout = stdout_of(&unfiltered);
+    assert!(stdout.contains("alpha_one"), "{stdout}");
+    assert!(stdout.contains("beta_one"), "{stdout}");
+
+    let filtered = run_in(
+        &dir,
+        &[
+            "--lcov-path",
+            "coverage.lcov",
+            "--filter",
+            "crates/beta",
+            ".",
+        ],
+    );
+
+    assert_eq!(
+        filtered.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_of(&filtered)
+    );
+    assert_eq!(
+        stdout_of(&filtered),
+        "\
+CRAP Report
+===========
+Function                       Module                                CC    Cov%     CRAP
+----------------------------------------------------------------------------------------
+beta_one                       beta                                   1  100.0%      1.0
+"
+    );
+    assert_eq!(stderr_of(&filtered), "");
+}
+
+#[test]
+fn a_filter_matching_nothing_says_so_and_still_exits_zero() {
+    // An empty report is indistinguishable from a clean workspace, and a
+    // mistyped fragment is by far the likeliest reason for one — so it is said
+    // out loud. It is still not an operational error (C6).
+    let dir = members_fixture("filter_nothing", ALPHA_SOURCE, BETA_SOURCE);
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:crates/alpha/src/lib.rs\nDA:2,1\nend_of_record\n",
+    )
+    .expect("write lcov");
+
+    let out = run_in(
+        &dir,
+        &[
+            "--lcov-path",
+            "coverage.lcov",
+            "--filter",
+            "crates/gamma",
+            ".",
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    // The table's own bytes are unchanged — it simply has no rows (C14) — and
+    // the report says on stdout that it has none (C27). The unmatched fragment
+    // itself stays on stderr: stdout speaks about the artifact, stderr about
+    // the request.
+    assert_eq!(
+        stdout_of(&out),
+        "\
+CRAP Report
+===========
+Function                       Module                                CC    Cov%     CRAP
+----------------------------------------------------------------------------------------
+
+no functions reported
+"
+    );
+    let stderr = stderr_of(&out);
+    assert_eq!(stderr.lines().count(), 1, "stderr: {stderr}");
+    assert!(stderr.contains("crates/gamma"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("matched no source file"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_workspace_of_nothing_but_test_code_says_its_report_is_empty() {
+    // C27, the same line for a cause that has nothing to do with filters: this
+    // workspace is entirely `#[cfg(test)]`, so there is no product function to
+    // report and nothing on stderr either. Without the line, a redirected
+    // report of a wholly untested crate is byte-identical to a clean one.
+    let dir = fixture("all_test_code");
+    fs::write(
+        dir.join("src").join("lib.rs"),
+        "#![cfg(test)]\n\n#[test]\nfn t() {}\n",
+    )
+    .expect("write test-only crate root");
+
+    let out = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).ends_with("\n\nno functions reported\n"),
+        "{}",
+        stdout_of(&out)
+    );
+    assert_eq!(stderr_of(&out), "");
+}
+
+/// The table's rows keyed by the Function column — everything after C14's
+/// four-line preamble, one entry per reported function.
+fn rows_by_function(stdout: &str) -> BTreeMap<String, String> {
+    stdout
+        .lines()
+        .skip(4)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| {
+            line.split_whitespace()
+                .next()
+                .map(|name| (name.to_string(), line.to_string()))
+        })
+        .collect()
+}
+
+#[test]
+fn filtering_changes_which_rows_appear_and_never_their_values() {
+    // C26 (B1). `--filter` is a **reporting** narrowing. Dropping unselected
+    // files in the discovery callback made it an *analysis* narrowing: the
+    // files never became units, so they never entered the join's claim map —
+    // and the claim map is what decides C19 `Superseded`/`Collision`. Filter
+    // away a record's exact claimant, or one of two equal claimants, and the
+    // survivor silently inherited a record nothing proved was its, reporting
+    // another file's coverage with no diagnostic at all. The join now sees the
+    // whole workspace and selection is applied to finished rows.
+    //
+    // Both C19 shapes, since each has its own way of going wrong.
+    //
+    // The third column pins the *filtered-away counterparty* in the position
+    // the attribution puts it in — `Superseded.winner`, `Collision.sources` —
+    // rather than merely somewhere in the line. In the superseded case the
+    // winner's text is equal to the LCOV key's, so a bare `contains` of the
+    // path would be satisfied by the key alone and would still pass if the
+    // winner were rewritten; the surrounding words are what make it an
+    // assertion about the winner.
+    for (name, lcov, kept, counterparty) in [
+        // Exactly one exact claimant (alpha): beta is superseded ⇒ N/A.
+        (
+            "filter_invariant_superseded",
+            "SF:src/lib.rs",
+            "beta_one",
+            "matches src/lib.rs exactly, so it is attributed there",
+        ),
+        // No exact claimant: alpha and beta collide ⇒ both N/A.
+        (
+            "filter_invariant_collision",
+            "SF:lib.rs",
+            "beta_one",
+            "is claimed by src/lib.rs, crates/beta/src/lib.rs",
+        ),
+    ] {
+        let dir = workspace_fixture(name);
+        fs::write(
+            dir.join("coverage.lcov"),
+            format!("{lcov}\nDA:2,1\nend_of_record\n"),
+        )
+        .expect("write single-record lcov");
+
+        let unfiltered = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+        let filtered = run_in(
+            &dir,
+            &[
+                "--lcov-path",
+                "coverage.lcov",
+                "--filter",
+                "crates/beta",
+                ".",
+            ],
+        );
+        assert_eq!(
+            unfiltered.status.code(),
+            Some(0),
+            "{name} stderr: {}",
+            stderr_of(&unfiltered)
+        );
+        assert_eq!(
+            filtered.status.code(),
+            Some(0),
+            "{name} stderr: {}",
+            stderr_of(&filtered)
+        );
+
+        let before = rows_by_function(&stdout_of(&unfiltered));
+        let after = rows_by_function(&stdout_of(&filtered));
+
+        // The narrowing did happen: alpha is gone, beta stayed.
+        assert!(before.contains_key("alpha_one"), "{name}: {before:?}");
+        assert_eq!(
+            after.keys().collect::<Vec<_>>(),
+            vec![kept],
+            "{name}: {after:?}"
+        );
+        // The invariant: for every file present in both runs, every reported
+        // value is identical — the row is compared whole, so CC, Cov% and CRAP
+        // are all covered.
+        for (function, row) in &after {
+            assert_eq!(
+                before.get(function),
+                Some(row),
+                "{name}: row for {function} changed under --filter"
+            );
+        }
+        // Concretely, Anders' case: beta's claim is unproven either way, so the
+        // filtered run reports the same N/A the unfiltered one does.
+        assert!(after[kept].contains("N/A"), "{name}: {}", after[kept]);
+        // And the diagnostic that explains the N/A survives the narrowing: it
+        // is about a file the report still contains.
+        let filtered_stderr = stderr_of(&filtered);
+        assert!(
+            filtered_stderr.contains("crates/beta/src/lib.rs"),
+            "{name} stderr: {filtered_stderr}"
+        );
+        // The other half of the invariant — the half that lives in the
+        // attribution's *referents* rather than its values. A surviving
+        // attribution still describes whole-workspace truth, so it still names
+        // the filtered-away counterparty: a file `--filter` removed from the
+        // report entirely. Pinned in the structural position the attribution
+        // puts it in — `Superseded.winner`, `Collision.sources` — because a
+        // plain `contains` of the path would not catch a rewrite. Dropping
+        // whole `(file, attribution)` pairs passes; rewriting an attribution
+        // to mention only selected files fails.
+        //
+        // The collision phrase also pins claimant *order*, deliberately: that
+        // order is contractual, not incidental. Claimants are listed in join
+        // input order (`src/join.rs`, `Collision.sources`), and the input is
+        // the workspace walk, which FC-T6b fixes as members by name, targets
+        // library-first then by name, files in module-graph order
+        // (`src/workspace/mod.rs`). Root package `alpha` before member `beta`
+        // is that contract, so `src/lib.rs, crates/beta/src/lib.rs` is the one
+        // correct rendering and a reordering is a regression, not noise.
+        assert!(
+            filtered_stderr.contains(counterparty),
+            "{name}: the surviving diagnostic no longer names the filtered-away \
+             counterparty in its attributed position: {filtered_stderr}"
+        );
+        // Invariant 1: beta's diagnostic is byte-identical between the two
+        // runs. Selected by site prefix in *both* runs rather than by
+        // comparing whole stderr, which would also pin incidental output —
+        // C18/C27 emit trailing notices under some conditions, so "stderr has
+        // one line" is not a property of this program.
+        let unfiltered_stderr = stderr_of(&unfiltered);
+        let beta_site = "warning: crates/beta/src/lib.rs: ";
+        let line_at = |stderr: &str, site: &str| {
+            stderr
+                .lines()
+                .find(|line| line.starts_with(site))
+                .map(str::to_string)
+        };
+        let before_line = line_at(&unfiltered_stderr, beta_site).unwrap_or_else(|| {
+            panic!("{name}: no unfiltered diagnostic for beta: {unfiltered_stderr}")
+        });
+        let after_line = line_at(&filtered_stderr, beta_site).unwrap_or_else(|| {
+            panic!("{name}: no filtered diagnostic for beta: {filtered_stderr}")
+        });
+        assert_eq!(
+            after_line, before_line,
+            "{name}: beta's diagnostic changed under --filter"
+        );
+        // Invariant 2, separately: the filtered-away unit's *own* diagnostic
+        // does not survive, even though beta's line still names it. Being a
+        // referent of a surviving attribution is not the same as being a
+        // diagnostic site. Asserted positively — no line is attributed to
+        // alpha — rather than by counting lines. (Vacuous in the superseded
+        // case, where alpha wins its record and is never diagnosed; the
+        // collision case is where alpha has a line to lose.)
+        let alpha_site = "warning: src/lib.rs: ";
+        assert_eq!(
+            line_at(&filtered_stderr, alpha_site),
+            None,
+            "{name}: the filtered-away file kept its own diagnostic: {filtered_stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_filtered_out_member_takes_its_diagnostics_with_it() {
+    // A filter scopes what the run is *about*, so it scopes what the run says.
+    // Warnings — and the C18 count — about a member that could never have
+    // appeared in the report describe a run the user did not ask for.
+    let dir = members_fixture(
+        "filter_scopes_diagnostics",
+        ALPHA_SOURCE,
+        &format!("mod absent;\n\n{BETA_SOURCE}"),
+    );
+    fs::write(
+        dir.join("coverage.lcov"),
+        "SF:crates/alpha/src/lib.rs\nDA:2,1\nend_of_record\n",
+    )
+    .expect("write lcov");
+
+    let unfiltered = run_in(&dir, &["--lcov-path", "coverage.lcov", "."]);
+    assert!(
+        stdout_of(&unfiltered).contains("1 module not analysed"),
+        "{}",
+        stdout_of(&unfiltered)
+    );
+
+    let out = run_in(
+        &dir,
+        &[
+            "--lcov-path",
+            "coverage.lcov",
+            "--filter",
+            "crates/alpha",
+            ".",
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("alpha_one"), "{stdout}");
+    assert!(!stdout.contains("not analysed"), "{stdout}");
+    assert_eq!(stderr_of(&out), "");
+}
+
+#[test]
+fn an_out_of_root_member_resolves_its_own_coverage() {
+    // FC-T9e: one string was doing two jobs. The display identity of a member
+    // above the workspace root must be relative (`../shared/tool.rs`, FC-T7a),
+    // but segment-wise matching against an absolute LCOV key can never succeed
+    // through a literal `".."` — so such a member was permanently N/A for every
+    // function, with its coverage sitting right there in the profile. The query
+    // is now derived from the identity instead of *being* it.
+    let base = Fixture::new("external_coverage");
+    let root = base.join("workspace");
+    fs::create_dir_all(root.join("src")).expect("create root src");
+    fs::create_dir_all(base.join("shared")).expect("create external dir");
+
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+         [[bin]]\nname = \"shared\"\npath = \"../shared/tool.rs\"\n\n\
+         [workspace]\n",
+    )
+    .expect("write workspace manifest");
+    fs::write(root.join("src").join("lib.rs"), ALPHA_SOURCE).expect("write root source");
+    fs::write(
+        base.join("shared").join("tool.rs"),
+        "fn main() {}\n\nfn shared_one() -> i32 {\n    2\n}\n",
+    )
+    .expect("write external source");
+    // The profile was produced under a build root of its own, so the external
+    // file's key is absolute — the case the `..` identity could never match.
+    fs::write(
+        root.join("coverage.lcov"),
+        "SF:src/lib.rs\nDA:2,1\nend_of_record\n\
+         SF:/build/proj/shared/tool.rs\nDA:4,1\nend_of_record\n",
+    )
+    .expect("write lcov");
+
+    let out = run_in(&root, &["--lcov-path", "coverage.lcov", "."]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        "\
+CRAP Report
+===========
+Function                       Module                                CC    Cov%     CRAP
+----------------------------------------------------------------------------------------
+alpha_one                      alpha                                  2  100.0%      2.0
+main                           shared                                 1  100.0%      1.0
+shared_one                     shared                                 1  100.0%      1.0
+"
+    );
+
+    // It resolved by suffix, and it is still *reported* by its relative
+    // identity — the query key never becomes the display path (D2/FC-T9o).
+    let stderr = stderr_of(&out);
+    assert_eq!(stderr.lines().count(), 1, "stderr: {stderr}");
+    assert!(stderr.contains("../shared/tool.rs"), "stderr: {stderr}");
+    assert!(stderr.contains("suffix match"), "stderr: {stderr}");
 }

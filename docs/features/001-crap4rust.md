@@ -63,7 +63,7 @@ Walking skeleton first, then layer outward.
 |-------|---------|------------|
 | S1 | **Walking skeleton**: `crap4rust --lcov-path X <crate>` parses one crate's `syn` AST, computes CC + CRAP from provided LCOV, prints "CRAP Report" table. No coverage running, no gate. | – |
 | S2 | **Zero-config coverage**: run `cargo llvm-cov` → `target/crap4rust/coverage.lcov`, then compute. `--test-command` override, `--lcov-path` BYO. | S1 |
-| S3 | **Workspace/monorepo**: enumerate workspace members; Package→Module crate-qualified naming; product-vs-test filtering; positional path-fragment filters. | S1 |
+| S3 | **Workspace/monorepo**: enumerate workspace members; Package→Module crate-qualified naming; product-vs-test filtering; positional path-fragment filters. **Complete** (T9, T9b, T10). | S1 |
 | S4 | **JSON contract**: versioned `--format json` output. | S1, S3 |
 | S5 | **Polish/perf**: `rayon` parallelism (`-j/--jobs`), display-band coloring, docs of async/macro limits, error UX. | S2–S4 |
 
@@ -83,7 +83,7 @@ One or more tasks per slice.
 | T8  | S2 | **Coverage runner** — invoke `cargo llvm-cov` → default `target/crap4rust/coverage.lcov`; `--test-command` override; zero-config default (C2). Makes `--lcov-path` optional — `missing_required_lcov_arg_exits_one` legitimately changes (expected evolution, not a regression). | **Done** | vibe/001 |
 | T9  | S3 | **Workspace enumeration** — cargo metadata; per-member modules, crate-qualified (C3). Checklist: replace `report::rows_from_joined` module derivation (FC-T6a); move source discovery out of `cli.rs` into its adapter; FC-T5a longest-overlap + `Ambiguous` resolution; FC-T5e `SourceUnit` refactor. | **Done** | vibe/001 |
 | T9b | S3 | **Diagnostic unification + single-parse streaming** (human-inserted, 2026-08-24). Discharges FC-T9d (one `Diagnostic{code,severity,phase,site,kind}`, one sink drained on `Err` **and** `Ok`), FC-T9h (discovery streams each parsed AST; one parse per file) and FC-T9k (`workspace/` split). Also lands C18 (incomplete-report notice), C19 (exact-wins collisions), C20 (module/name normalisation). | **Done** | vibe/001 |
-| T10 | S3 | **Product/test filtering** — exclude `#[cfg(test)]`/`#[test]`; `tests/`/`benches/`/`examples/` non-product; positional path-fragment filters (C5). Also FC-T9g (drop empty units before the join), FC-T9e (query key ≠ display path), FC-T9j (PATH is a locator; filters get their own surface). | Pending | - |
+| T10 | S3 | **Product/test filtering** — exclude `#[cfg(test)]`/`#[test]`; `tests/`/`benches/`/`examples/` non-product; positional path-fragment filters (C5). Also FC-T9g (drop empty units before the join), FC-T9e (query key ≠ display path), FC-T9j (PATH is a locator; filters get their own surface). Also landed C22 (declined counts distinct modules), C25 (source-only MSRV floor + `msrv` CI job), C26 (filter is a reporting narrowing), C27 (zero-row report says so), C29 (case-sensitive). **Closes S3.** | **Done** | vibe/001 |
 | T11 | S4 | **JSON reporter** — versioned schema (`schema_version`), stable field contract. | Pending | - |
 | T12 | S5 | **Parallelism** — `rayon` across members/files; `-j/--jobs`, full CPUs default (C7). | Pending | - |
 | T13 | S5 | **Docs & limits** — async/macro CC caveats (C12), README, `--help`. Must document: FC-T8f "no spaces in `--test-command`" (workaround `--lcov-path`); the C17 crap4go `--test-command` divergences + `{lcov}` vs `{coverprofile}` migration note; FC-T5c (`total==0` renders `100.0%`); C15 duplicate-display-name rows. | Pending | - |
@@ -297,7 +297,9 @@ Forward constraints:
 - **FC-T9l (T13 documentation debt).** Orphan `.rs` files are not analysed (a **behaviour change**
   from S1's directory walk — a user may notice a file "disappear"); declined conditionally-pathed
   subtrees are unmeasured; `PATH` is a locator, not a scope; **the report may be silently incomplete
-  without reading stderr**; out-of-root members report `..` paths and today N/A coverage.
+  without reading stderr**; out-of-root members report `..` paths and today N/A coverage; **on Windows,
+  two workspace members on different drive letters cannot both be made root-relative** — see the
+  documented limit at `src/workspace/mod.rs` (`workspace_relative`).
 
 ### C18–C21 — Human rulings on T9 (2026-08-24)
 
@@ -396,7 +398,115 @@ Forward constraints:
   (converts the emergent dedup property back into a stated one and guards the C18 number);
   `Superseded` end-to-end at integration level to pin ordering.
 
+### C22–C24 — Human rulings on T9b (2026-08-24)
+
+- **C22 — C18 counts distinct modules (resolves Anders §"new wart").** `declined()` currently counts
+  **diagnostics**, so two cfg-guarded declarations of one module count 2. It must **dedupe by module
+  path**. The `cfg_attr` subtree case remains a **lower bound** — one decline drops an unknown-sized
+  subtree — and T13 must state that the number is a lower bound, not an exact count. Land in T10.
+- **C23 — `severity` is warning-only while C6 holds (confirms FC-T9p as binding).** `Severity::Error`
+  **must not** be added. A diagnostic that says "error" and exits 0 is worse than no severity field at
+  all; operational failures are `Err`, which is their correct home. `severity` earns its place solely
+  by reserving the JSON slot so the wire shape cannot change later.
+- **C24 — JSON `warnings[]` is flat with a non-contractual `data` object (resolves FC-T9m).** Entries
+  are `{code, severity, phase, file, line, column, message}` plus an **explicitly open, explicitly
+  non-contractual** `data` object carrying the particulars. Rationale: a variant-shaped union would
+  make **every future `Kind` variant a schema change**, and `Kind` has grown from 0 to 10 variants in
+  two tasks. `code` strings are **append-only and never renamed** once emitted; byte-lock all ten.
+  Consumers branch on `code` and read `message`; anything in `data` is best-effort.
+
+### C25–C29 — Human rulings on T10 (2026-08-24)
+
+- **C25 — MSRV is a SOURCE-ONLY floor.** `rust-version = "1.82"` describes **our crate's source**, not the
+  committed `Cargo.lock`; consumers regenerate. Discovered while implementing: the prior declaration
+  was **already false** — the committed lock pins `clap_builder` requiring edition2024 (Cargo ≥ 1.85).
+  CI `msrv` job (ubuntu-only) reads the floor from `Cargo.toml`, installs and **verifies** the
+  toolchain, deletes the lock, regenerates with **stable** cargo under
+  `CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback`, then `cargo +1.82 build --locked`. The
+  comments must state precisely what this does **not** prove: test-only code (`cargo build` compiles
+  no `#[cfg(test)]` items), non-Ubuntu targets, and unaided Cargo 1.82 resolution.
+- **C26 — `--filter` is a REPORTING narrowing; the numbers are invariant under it.** Filtering changes
+  **which rows appear, never their values**. This is a product promise, not an implementation detail.
+  Consequence: the join must see **every** discovered unit so the claim map is complete; selection
+  happens on rows, before formatting. Invariant to pin with a test: *for any file present in both
+  runs, every reported value is identical filtered and unfiltered.*
+- **C27 — a zero-row report says so on stdout.** One line, one shape, covering the typo'd filter, the
+  over-narrow filter, the all-test-code workspace and the genuinely empty crate alike. Rationale
+  (Anders): a redirected empty report is today indistinguishable from a clean one **for reasons
+  unrelated to filters**, which shows the filter framing was the wrong place to attack it — this
+  dissolves the unmatched-filter question rather than answering it. An unmatched filter stays
+  **stderr-only**: stdout carries statements about completeness *relative to what was asked for*, and
+  an unmatched filter means nothing was asked for.
+- **C28 — JSON echoes the effective request (FC-T10a).** T11's document carries top-level
+  `filters: [...]` (and arguably the coverage source). `--filter` is a new reason `functions[]` may be
+  short and a consumer cannot otherwise distinguish "no risk" from "you narrowed it". Due **before**
+  `schema_version` freezes: without it, a frozen v1 is not self-describing.
+- **C29 — filters stay case-sensitive on every platform, including Windows.** T13 documents the
+  surprise. A "did you mean" hint is **rejected**: it invites fuzzy matching into a tool whose entire
+  thesis is refusing to guess.
+
+### T10 review notes (Bhaskar FAIL ×3 → PASS; Anders — approve-with-suggestions, 1 blocking → approved; **S3 closes**, 2026-08-24)
+
+**Bhaskar rounds.**
+1. **FAIL** — the empty-unit drop was broader than FC-T9g permits: it dropped legitimate **zero-function
+   product** units, whose LCOV record was then silently consumed by another crate. The many-to-one
+   attribution bug, **second appearance**. Also `#[cfg(test)] trait` methods still measured; integration
+   fixtures leaked ~40 directories.
+2. **FAIL** — whole-file test-only classification applied too late, so `#![cfg(test)] mod child;` still
+   descended into the subtree. Declared MSRV unenforced.
+3. **FAIL** (wording only) — the `msrv` job's comments overstated what it proves. Corrected → **PASS**.
+
+**Anders — one blocking, B1.** `--filter` was applied **before** the join, so narrowing a report changed
+the numbers in it: the claim map was incomplete and a filtered run could report another file's
+coverage. The many-to-one bug, **third appearance** — and the first one Bhaskar missed. Fixed by joining
+over all units and selecting rows afterwards (`retain_selected`, applied to `functions` **and**
+`attributions`). Ruled C26. Bhaskar recorded the corrected heuristic: *whenever a stage drops or scopes
+inputs, identify every later aggregation, attribution, dedup or ranking whose result depends on the
+complete input set.*
+
+**Endorsed.**
+- `src/product.rs` — the single **pure** definition of "test code" (C5), consumed by `complexity` and
+  `modgraph` alike. Anders: the best piece of design in this slice. Its stated rule — *we evaluate
+  nothing whose truth depends on an environment we do not have* — is the T9 stance said once, in the
+  one place it is decidable.
+- The **funnel-gate refactor**: five per-kind checks collapsed to three gates at `syn`'s routing points
+  (`visit_item`, `visit_impl_item`, `visit_trait_item`). `cfg` is not inherited, so a `#[cfg(test)]`
+  container's members carry no evidence — the question must be asked of the **container**. The
+  `_ => &[]` fallback fails toward **product**: over-report, never silent loss.
+- `test`-decidability judged **principled, not convenient**: `cfg(test)` is the one cfg whose truth we
+  know without an environment, because *cargo* sets it. (True of cargo, not rustc — `RUSTFLAGS --cfg
+  test` can force it; T13 documents this.)
+- B1's regression test carries two **named** invariants, not one over-broad equality: beta's diagnostic
+  is byte-identical across runs (selected by site prefix in both), and the filtered-away unit's **own**
+  diagnostic does not survive — asserted by absence, never by stderr line count. Counterparty phrases
+  pin the filtered-away file in its *rendered attributed position*, which a bare `contains` could not
+  (the LCOV key is the same string). Both sharpenings were mutation-proved, not argued.
+
+**Forward constraints.**
+- **FC-T10c (referential closure is not a schema guarantee — supersedes FC-T9o's wording).** Under
+  `--filter`, `Superseded.winner` and `Collision.sources` may name files **absent from `functions[]`**.
+  That is correct per C26 — attributions describe **whole-workspace** truth — but it means T11's
+  document is **not referentially closed**. The schema must say so **where those fields are defined**.
+  FC-T9o's requirement that the identity be byte-identical to a row's `file` still holds; its
+  implication that a matching row always exists does not.
+- **FC-T10d (two sections never merged).** The request echo (C28/FC-T10a) and the findings are distinct
+  kinds of fact. Discriminator: *would this value differ if the same request produced a different
+  artifact?* If no, it is request echo; if yes, it is a finding. Never let one drift into the other.
+- **FC-T10e (JSON carries `declined` only — no redundant `rows`).** Corrects the "two structural
+  fields" reading of FC-T9n: `functions.length` **is** the row count. Emitting a count beside the array
+  creates a second source of truth that can disagree with the first.
+- **FC-T10f (display-identity ≠ query-key is a STANDING invariant).** FC-T9e is
+  **discharged-with-standing-invariant**, not closed. `query_key` strips leading `../` for the LCOV
+  query **only**; the display path is untouched. Any future normalisation must preserve the split.
+  Guarded at three sites (definition of `query_key`, cross-reference from `workspace_relative`, two
+  tests pinning the pair) — keep all three.
+- **Claimant ordering is contractual, not incidental.** `Collision.sources` is join-input order, which
+  is the FC-T6b walk order (members by name; targets library-first then by name; files in module-graph
+  order); verified end-to-end with no unordered collection in the chain. **T12 must preserve it** when
+  rayon lands — the integration assertion says so out loud rather than failing mysteriously later.
+
 ### C16 — Bidirectional path matching — **DELIBERATE DIVERGENCE (verified, 2026-08-24)**
+
 
 crap4go's `suffixMatch` (`internal/coverage/coverage.go`, `unclebob/crap4go` @ `bee16db`) is
 **one-directional** — it returns `false` as soon as `len(suffixParts) > len(pathParts)`, so only the

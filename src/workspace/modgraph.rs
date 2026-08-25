@@ -21,14 +21,23 @@
 //! claimant of a file owns and names it, which is what makes ordering
 //! deterministic (FC-T6b).
 //!
-//! **One `cfg` construct is not deferrable.** `#[cfg(..)]` decides *whether* a
-//! module is compiled; `#[cfg_attr(.., path = "..")]` decides *which file* it
-//! is compiled from. Guessing the former over-reports at worst; guessing the
-//! latter measures a file rustc never compiled and reports the numbers as if it
-//! had. So a conditionally-pathed module is diagnosed and left unanalysed — we
-//! may decline to answer, but never answer confidently and wrongly. Advisory
-//! only: the exit code is unaffected (C6), though the report itself says how
-//! much was declined (C18).
+//! **What this walk evaluates is [`crate::product`]'s rule, not its own:** we
+//! evaluate nothing whose truth depends on an environment we do not have. Two
+//! consequences land here; neither is argued again.
+//!
+//! `#[cfg_attr(.., path = "..")]` decides *which file* a module is compiled
+//! from, and that depends on the cfg set — so such a module is diagnosed and
+//! left unanalysed, because guessing it would measure a file rustc never
+//! compiled and report the numbers as if it had. We may decline to answer, but
+//! never answer confidently and wrongly. Advisory only: the exit code is
+//! unaffected (C6), though the report itself says how much was declined (C18).
+//!
+//! `test` depends on no environment we lack, so it *is* resolved (T10/C5): a
+//! test-only `mod` declaration is skipped outright rather than resolved, and a
+//! file that is test-only *as a whole* (`#![cfg(test)]`) is neither yielded nor
+//! descended into — which *removes* declines rather than manufacturing answers
+//! (FC-T9g). The walk asks the question at the two places descent is decided;
+//! [`crate::product`] answers it.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
@@ -129,6 +138,20 @@ impl<'a> Walker<'a> {
             {
                 self.parses += 1;
             }
+            // A whole-file test-only unit is not product source, and the
+            // consequence of that is *structural*: it declares no product
+            // modules either. `#![cfg(test)] mod child;` names a `child` that
+            // no non-test build compiles, so descending would measure
+            // `child.rs` and let it stake a coverage claim — or, when it is
+            // absent or conditionally pathed, diagnose a declined module and
+            // inflate the C18 count — for code that does not exist in the
+            // product (FC-T9g). Test-only status must stop the *descent*, not
+            // merely discard the unit downstream, so it is asked here, at the
+            // one place descent is decided, alongside the per-declaration
+            // check below.
+            if crate::product::is_test_only_file(&ast) {
+                continue;
+            }
             declared_modules(
                 &ast.items,
                 &scope,
@@ -183,6 +206,16 @@ impl Scope {
 /// `mod foo { .. }` blocks — which contribute a name *and* a directory segment
 /// without being a file of their own.
 ///
+/// A test-only declaration (C5) is not descended into at all: `#[cfg(test)] mod
+/// tests;` names a file that is not product source, so resolving it would at
+/// best yield a unit with no product functions and at worst — when the file is
+/// absent, or lives behind another cfg — report a **declined module** for code
+/// we were never going to measure, inflating the C18 count on the artifact
+/// itself (FC-T9g). Which `cfg` predicates count as test-only, and why `test`
+/// is the one predicate we resolve without knowing the cfg set, is
+/// [`crate::product`]'s; the conditional-*path* decline below is untouched by
+/// it.
+///
 /// Every diagnostic a declaration produces points at that declaration's
 /// `file:line:column`, the way rustc points at one. Two declarations of the
 /// same module are two conditions — `#[cfg(unix)] mod imp;` and
@@ -201,6 +234,9 @@ fn declared_modules(
         let syn::Item::Mod(declaration) = item else {
             continue;
         };
+        if crate::product::is_test_only(&declaration.attrs) {
+            continue;
+        }
         let name = declaration.ident.to_string();
         let mut segments = scope.segments.clone();
         segments.push(name.clone());
@@ -266,7 +302,8 @@ fn declared_modules(
 /// **A module that resolves to nothing is diagnosed, not fatal.** Such a
 /// workspace does not compile as-is, but the same declaration is legitimately
 /// unresolvable for us when it is behind an inactive `cfg` whose file was never
-/// written — and we do not evaluate `cfg` (T10). A reporter that refused to
+/// written — and a `cfg` we cannot resolve is not evaluated
+/// ([`crate::product`]). A reporter that refused to
 /// report at all would be worse than one that reports what it found and says
 /// what it could not reach; what it must never do is stay silent (C6: advisory,
 /// exit code unaffected).
@@ -337,7 +374,7 @@ fn resolve_module(
 }
 
 /// Where a `mod` declaration's source file comes from, as far as we can tell
-/// without evaluating `cfg`.
+/// without the cfg set ([`crate::product`]).
 enum ModulePath {
     /// No `path` attribute: rustc's default filename rules apply.
     Default,
@@ -716,7 +753,7 @@ pub(super) mod tests {
         assert!(line.contains("src/absent.rs"), "{line}");
         assert!(line.contains("src/absent/mod.rs"), "{line}");
         // C18 counts it: the module is simply not in the report.
-        assert!(diagnostics[0].kind.declines_analysis(), "{line}");
+        assert_eq!(diagnostics[0].kind.declined_module(), Some("demo::absent"));
     }
 
     /// Both files present is an error to rustc; here it is a warning naming
@@ -736,21 +773,75 @@ pub(super) mod tests {
         let line = diagnostics[0].to_string();
         assert!(line.contains("src/foo.rs"), "{line}");
         assert!(line.contains("src/foo/mod.rs"), "{line}");
-        assert!(!diagnostics[0].kind.declines_analysis(), "{line}");
+        assert!(diagnostics[0].kind.declined_module().is_none(), "{line}");
     }
 
-    /// The T10 seam: *loading* a declared module is graph resolution and
-    /// happens here, whatever attributes guard the declaration. Deciding that
-    /// what it contains is test code — and dropping it — is T10 filtering.
+    /// FC-T9g: a test-only declaration is not resolved at all. Loading it would
+    /// at best yield a unit with no product functions, and — as here, where the
+    /// file is absent — would otherwise report a **declined module** for code
+    /// that was never going to be measured, putting a wrong number on the
+    /// artifact itself (C18).
     #[test]
-    fn a_cfg_guarded_module_declaration_is_still_resolved() {
-        let tree = Tree::new("cfg_module");
-        tree.write("src/lib.rs", "#[cfg(test)]\nmod tests;\n")
-            .write("src/tests.rs", "");
+    fn a_test_only_module_declaration_is_not_resolved() {
+        let tree = Tree::new("cfg_test_module");
+        tree.write("src/lib.rs", "#[cfg(test)]\nmod tests;\nmod present;\n")
+            .write("src/present.rs", "");
 
         let (files, diagnostics) = tree.walk("demo", "src/lib.rs");
 
-        assert_eq!(modules(&files), vec!["demo", "demo::tests"], "{files:?}");
+        assert_eq!(modules(&files), vec!["demo", "demo::present"], "{files:?}");
+        assert!(diagnostics.is_empty(), "{:?}", rendered(&diagnostics));
+    }
+
+    /// The same rule, applied to a whole file: `#![cfg(test)]` makes the file
+    /// *and everything it declares* absent from a non-test build, so the walk
+    /// must not descend. Dropping only the resulting unit is too late — the
+    /// child was already resolved, and its apparently-product functions would
+    /// be measured, reported, and would stake a coverage claim for a module
+    /// that does not exist in the product (FC-T9g).
+    #[test]
+    fn a_test_only_file_is_not_descended_into() {
+        let tree = Tree::new("cfg_test_file");
+        tree.write("src/lib.rs", "mod harness;\nmod present;\n")
+            .write("src/harness.rs", "#![cfg(test)]\nmod child;\n")
+            .write("src/harness/child.rs", "fn helper() {}\n")
+            .write("src/present.rs", "");
+
+        let (files, diagnostics) = tree.walk("demo", "src/lib.rs");
+
+        // Neither the test-only file nor the child it declares is yielded.
+        assert_eq!(modules(&files), vec!["demo", "demo::present"], "{files:?}");
+        assert!(diagnostics.is_empty(), "{:?}", rendered(&diagnostics));
+    }
+
+    /// And with the child *absent*, the descent that must not happen is the one
+    /// that would otherwise emit a discovery diagnostic and put a wrong number
+    /// on the artifact itself (C18) — for a module no non-test build compiles.
+    #[test]
+    fn a_test_only_file_declaring_a_missing_module_is_not_diagnosed() {
+        let tree = Tree::new("cfg_test_file_missing");
+        tree.write("src/lib.rs", "mod harness;\n")
+            .write("src/harness.rs", "#![cfg(test)]\nmod child;\n");
+
+        let (files, diagnostics) = tree.walk("demo", "src/lib.rs");
+
+        assert_eq!(modules(&files), vec!["demo"], "{files:?}");
+        assert!(diagnostics.is_empty(), "{:?}", rendered(&diagnostics));
+    }
+
+    /// And the line holds exactly there: `test` is the one predicate that
+    /// resolves without a cfg set. Every other `cfg` is followed as before —
+    /// `#[cfg(unix)] mod imp;` is product source on unix and the graph has no
+    /// business deciding it is not.
+    #[test]
+    fn a_non_test_cfg_guarded_module_declaration_is_still_resolved() {
+        let tree = Tree::new("cfg_module");
+        tree.write("src/lib.rs", "#[cfg(unix)]\nmod imp;\n")
+            .write("src/imp.rs", "");
+
+        let (files, diagnostics) = tree.walk("demo", "src/lib.rs");
+
+        assert_eq!(modules(&files), vec!["demo", "demo::imp"], "{files:?}");
         assert!(diagnostics.is_empty(), "{:?}", rendered(&diagnostics));
     }
 
@@ -780,7 +871,7 @@ pub(super) mod tests {
         assert!(line.contains("src/lib.rs:2:5"), "{line}");
         assert!(line.contains("path = \"windows.rs\""), "{line}");
         // The module and its whole subtree are unmeasured, so C18 counts it.
-        assert!(diagnostics[0].kind.declines_analysis(), "{line}");
+        assert_eq!(diagnostics[0].kind.declined_module(), Some("demo::imp"));
     }
 
     /// The same holds for an inline module: a conditional `path` there names

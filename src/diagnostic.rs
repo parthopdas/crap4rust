@@ -144,6 +144,9 @@ pub(crate) enum Kind {
     /// This file's claim on an LCOV record lost to a claimant that matched it
     /// exactly (C19).
     CoverageSuperseded { key: String, winner: String },
+    /// A `--filter` fragment selected no source file at all (C5): the report it
+    /// produced is empty of that fragment's code, not of risk.
+    FilterMatchedNothing { filter: String },
 }
 
 impl Kind {
@@ -161,23 +164,31 @@ impl Kind {
             Self::CoverageAbsent => "coverage-absent",
             Self::CoverageContested { .. } => "coverage-contested",
             Self::CoverageSuperseded { .. } => "coverage-superseded",
+            Self::FilterMatchedNothing { .. } => "filter-matched-nothing",
         }
     }
 
-    /// `true` when this diagnostic reports work the tool **declined**: a module
-    /// (and, for a conditional path, its whole subtree) that is not in the
-    /// report at all. That is what C18's stdout notice counts — a report which
-    /// can be silently incomplete is a correctness problem, and stderr is the
-    /// wrong channel for a fact about the artifact.
+    /// The module this diagnostic reports the tool **declined** to analyse — a
+    /// module (and, for a conditional path, its whole subtree) that is not in
+    /// the report at all — or `None` when nothing was declined.
+    ///
+    /// The single predicate behind C18's stdout notice and, later, the JSON
+    /// document's declined count (FC-T9n). It yields the module *path* rather
+    /// than a bool because the notice counts **distinct modules** (C22): two
+    /// cfg-guarded declarations of one module — `#[cfg(unix)] mod imp;` and
+    /// `#[cfg(windows)] mod imp;` — are two diagnostics, both worth printing,
+    /// but one module missing from the report.
     ///
     /// A module resolved from two candidate files is *not* a decline: one of
     /// them was analysed. A coverage miss is not one either: the functions are
     /// reported, they just carry `N/A`.
-    pub(crate) fn declines_analysis(&self) -> bool {
-        matches!(
-            self,
-            Self::ModuleFileMissing { .. } | Self::ModulePathConditional { .. }
-        )
+    pub(crate) fn declined_module(&self) -> Option<&str> {
+        match self {
+            Self::ModuleFileMissing { module, .. } | Self::ModulePathConditional { module, .. } => {
+                Some(module)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -235,6 +246,10 @@ impl fmt::Display for Kind {
                 "LCOV entry {key} matches {winner} exactly, so it is attributed there; \
                  its functions report N/A"
             ),
+            Self::FilterMatchedNothing { filter } => write!(
+                f,
+                "--filter `{filter}` matched no source file; nothing it selects is in the report"
+            ),
         }
     }
 }
@@ -272,6 +287,12 @@ impl Diagnostic {
     /// A fact about the *run*, at a site in the workspace.
     pub(crate) fn run(site: Site, kind: Kind) -> Self {
         Self::new(Phase::Run, Some(site), kind)
+    }
+
+    /// A fact about the *run* that no single file is the subject of — a
+    /// `--filter` that selected nothing is about the workspace as a whole.
+    pub(crate) fn global(kind: Kind) -> Self {
+        Self::new(Phase::Run, None, kind)
     }
 
     /// The one construction path, so `code` and `severity` can never disagree
@@ -339,28 +360,59 @@ mod tests {
         );
     }
 
-    /// C18 counts declined *work*, not every warning: a module resolved from
-    /// two candidates was analysed, and a coverage miss still reports its
-    /// functions.
+    /// C18/C22 counts declined *work*, by module: a module resolved from two
+    /// candidates was analysed, and a coverage miss still reports its
+    /// functions. Two declarations of one module name one module.
     #[test]
-    fn only_declined_work_counts_as_not_analysed() {
-        assert!(Kind::ModuleFileMissing {
-            module: "demo::absent".to_string(),
-            candidates: Vec::new(),
-        }
-        .declines_analysis());
-        assert!(Kind::ModulePathConditional {
-            module: "demo::imp".to_string(),
-            attribute: "#[cfg_attr(windows, path = \"windows.rs\")]".to_string(),
-        }
-        .declines_analysis());
-        assert!(!Kind::ModuleFileAmbiguous {
-            module: "demo::foo".to_string(),
-            candidates: Vec::new(),
-            analysed: "src/foo.rs".to_string(),
-        }
-        .declines_analysis());
-        assert!(!Kind::CoverageAbsent.declines_analysis());
+    fn only_declined_work_names_a_module_that_was_not_analysed() {
+        assert_eq!(
+            Kind::ModuleFileMissing {
+                module: "demo::absent".to_string(),
+                candidates: Vec::new(),
+            }
+            .declined_module(),
+            Some("demo::absent")
+        );
+        assert_eq!(
+            Kind::ModulePathConditional {
+                module: "demo::imp".to_string(),
+                attribute: "#[cfg_attr(windows, path = \"windows.rs\")]".to_string(),
+            }
+            .declined_module(),
+            Some("demo::imp")
+        );
+        assert_eq!(
+            Kind::ModuleFileAmbiguous {
+                module: "demo::foo".to_string(),
+                candidates: Vec::new(),
+                analysed: "src/foo.rs".to_string(),
+            }
+            .declined_module(),
+            None
+        );
+        assert_eq!(Kind::CoverageAbsent.declined_module(), None);
+        assert_eq!(
+            Kind::FilterMatchedNothing {
+                filter: "crates/gone".to_string(),
+            }
+            .declined_module(),
+            None
+        );
+    }
+
+    /// A filter that selected nothing is a fact about the whole run, not about
+    /// any one file, so it renders without a site.
+    #[test]
+    fn an_unmatched_filter_renders_without_a_site() {
+        let diagnostic = Diagnostic::global(Kind::FilterMatchedNothing {
+            filter: "crates/gone".to_string(),
+        });
+        assert_eq!(
+            diagnostic.to_string(),
+            "warning: --filter `crates/gone` matched no source file; \
+             nothing it selects is in the report"
+        );
+        assert_eq!(diagnostic.phase, Phase::Run);
     }
 
     /// Every kind has its own code: a shared one would make T11's `warnings[]`
@@ -396,6 +448,9 @@ mod tests {
             Kind::CoverageSuperseded {
                 key: String::new(),
                 winner: String::new(),
+            },
+            Kind::FilterMatchedNothing {
+                filter: String::new(),
             },
         ];
         let mut codes: Vec<&str> = kinds.iter().map(Kind::code).collect();

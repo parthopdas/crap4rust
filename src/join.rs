@@ -75,8 +75,9 @@ pub(crate) struct SourceUnit {
     /// Crate-qualified module path (C3), e.g. `demo::foo::bar`.
     pub(crate) module: String,
     /// The path this file is known by — workspace-relative and forward-slashed
-    /// as produced by discovery. Both the LCOV query key and the C15 identity
-    /// `file`.
+    /// as produced by discovery. This is the C15 identity `file`; the LCOV
+    /// query is *derived* from it rather than being it (FC-T9e, see
+    /// [`query_key`]).
     pub(crate) path: String,
     /// The functions the CC engine found in this file.
     pub(crate) functions: Vec<FunctionComplexity>,
@@ -167,7 +168,7 @@ pub(crate) fn join<'a>(lcov: &'a LcovData, units: &[SourceUnit]) -> JoinResult<'
     // 1. Resolve each file once — not once per function.
     let resolved: Vec<Resolution<'a>> = units
         .iter()
-        .map(|unit| lcov.resolve_path(&unit.path))
+        .map(|unit| lcov.resolve_path(query_key(&unit.path)))
         .collect();
 
     // 2. Who claims which LCOV record, and how strongly. Distinct *paths*
@@ -258,6 +259,28 @@ fn contested<'a>(
             sources: claimants.iter().map(|claim| claim.path.clone()).collect(),
         },
     }
+}
+
+/// The LCOV query key for a source file's display path (FC-T9e).
+///
+/// One string used to do two jobs: the C15 **display identity** — which must be
+/// relative, so a member above the workspace root reads `../shared/tool.rs`
+/// (FC-T7a/D2) — and the **LCOV query**, where those leading `..` segments are
+/// fatal: [`LcovData::resolve_path`] matches whole segments, and no absolute
+/// LCOV key ever ends with a literal `".."`, so an out-of-root member was
+/// permanently `N/A` for every function even when the profile held its data.
+///
+/// FC-T7a binds the reported path, not the query, so the two are separated
+/// here: leading `..` segments are dropped and what remains — the file's path
+/// under its own directory — is matched suffix-wise as usual. A path without
+/// `..` (every in-root member) is its own query, so no existing resolution
+/// changes, exact matches included.
+fn query_key(path: &str) -> &str {
+    let mut rest = path;
+    while let Some(tail) = rest.strip_prefix("../") {
+        rest = tail;
+    }
+    rest
 }
 
 /// The function's full module path (C20): the file's crate-qualified module
@@ -377,6 +400,53 @@ end_of_record
         let j = join_one("src/other.rs", fc("absent", 7, 10, 13));
         assert_eq!(j.coverage, None);
         assert_eq!(j.crap, None);
+    }
+
+    /// FC-T9e: the display path and the LCOV query are two different jobs. A
+    /// member above the workspace root must keep its `..` identity (FC-T7a) and
+    /// must still find its coverage: `suffix_overlap` compares whole segments,
+    /// and no absolute LCOV key ends with a literal `".."`, so before this the
+    /// file was N/A for every function even with its data right there.
+    #[test]
+    fn an_out_of_root_path_queries_without_its_dot_dot_segments() {
+        assert_eq!(query_key("src/lib.rs"), "src/lib.rs");
+        assert_eq!(query_key("../shared/tool.rs"), "shared/tool.rs");
+        assert_eq!(query_key("../../x/src/lib.rs"), "x/src/lib.rs");
+
+        let lcov = parse_lcov("SF:/build/proj/shared/tool.rs\nDA:10,1\nend_of_record\n")
+            .expect("valid lcov");
+        let units = vec![unit("../shared/tool.rs", vec![fc("f", 1, 10, 10)])];
+        let result = join(&lcov, &units);
+
+        assert_eq!(result.functions[0].coverage, Some(1.0));
+        // The identity it is reported and diagnosed by is unchanged.
+        assert_eq!(result.functions[0].file, "../shared/tool.rs");
+        assert_eq!(result.attributions[0].0, "../shared/tool.rs");
+    }
+
+    /// The two path jobs meet: `--filter` matches the **display identity**
+    /// (FC-T9j) while the LCOV query is derived from it (FC-T9e), so an
+    /// out-of-root member is filterable by the directory it actually lives in
+    /// *and* still resolves its coverage. A filter written against the query
+    /// key — `--filter shared` — must select it too; the `..` segments belong
+    /// to neither job's vocabulary.
+    #[test]
+    fn an_out_of_root_path_is_filterable_by_the_segments_it_is_queried_by() {
+        use crate::filter::Filters;
+
+        let path = "../shared/tool.rs";
+        let filters = |fragment: &str| Filters::new(&[fragment.to_string()]);
+
+        assert!(filters("shared").select(path).is_selected());
+        assert!(filters("shared/tool.rs")
+            .select(query_key(path))
+            .is_selected());
+        // The `..` is part of the identity, so it is matchable — but it is not
+        // part of the query, and a fragment naming a directory that is not
+        // there still selects nothing.
+        assert!(filters("..").select(path).is_selected());
+        assert!(!filters("..").select(query_key(path)).is_selected());
+        assert!(!filters("workspace/shared").select(path).is_selected());
     }
 
     #[test]

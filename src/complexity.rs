@@ -9,11 +9,20 @@
 //! here. `async`/`.await` desugaring is likewise not modelled — `.await` is not
 //! itself a decision point. These are deliberate, documented limitations (C12).
 //!
+//! **Product source only (C5).** Items a normal `cargo build` never compiles —
+//! `#[test]` functions and anything behind a `cfg` requiring `test` — are not
+//! measured, so they never reach a report row. The classification itself is
+//! [`crate::product`]'s, asked here because this is where item attributes are
+//! in view: a `FunctionComplexity` no longer carries them, so a downstream
+//! filter could not tell a test helper from a product function.
+//!
 //! The public surface below is consumed by later pipeline tasks (naming/identity,
 //! CRAP join, CLI).
 
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
+
+use crate::product;
 
 /// Cyclomatic complexity plus source span for a single analysed function.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +67,8 @@ pub(crate) fn analyze_str(src: &str) -> syn::Result<Vec<FunctionComplexity>> {
 /// "Every function" means free `fn`s, inherent/trait-impl methods, provided
 /// (default-bodied) trait methods, and nested `fn` items — each nested `fn` is
 /// its own function. Closures are *not* separate functions: their decisions are
-/// attributed to the enclosing named function.
+/// attributed to the enclosing named function. Test-only items are not
+/// functions of the product and are skipped whole, subtree and all (C5).
 pub(crate) fn analyze_file(file: &syn::File) -> Vec<FunctionComplexity> {
     let mut collector = FnCollector {
         results: Vec::new(),
@@ -166,6 +176,38 @@ fn self_type_name(ty: &syn::Type) -> String {
 }
 
 impl<'ast> Visit<'ast> for FnCollector {
+    /// The single gate for every item kind (C5).
+    ///
+    /// `cfg` is not inherited: the methods of a `#[cfg(test)] trait` carry no
+    /// attribute of their own, so the question has to be asked of the
+    /// *container*. Asking it here — where `syn` funnels every item, at file
+    /// scope, inside a `mod`, or as a statement in a function body — covers
+    /// every kind at once, including the kinds that can hide a `fn` in an
+    /// initialiser (`const`, `static`), so no future item kind can slip past a
+    /// list of the ones we thought of.
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        if product::is_test_only_item(node) {
+            return;
+        }
+        visit::visit_item(self, node);
+    }
+
+    /// The same gate for members of an `impl` block.
+    fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+        if product::is_test_only_impl_item(node) {
+            return;
+        }
+        visit::visit_impl_item(self, node);
+    }
+
+    /// The same gate for members of a `trait` definition.
+    fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
+        if product::is_test_only_trait_item(node) {
+            return;
+        }
+        visit::visit_trait_item(self, node);
+    }
+
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
         self.ctx.push(Ctx::Mod(node.ident.to_string()));
         visit::visit_item_mod(self, node);
@@ -731,5 +773,89 @@ mod tests {
         // the `if` counts → base 1 + 1 = 2.
         let src = "async fn f(x: i32) -> i32 { if x > 0 { g().await } else { 0 } }";
         assert_eq!(cc(src), 2);
+    }
+
+    /// C5: test code is not the product. A test module is skipped whole — its
+    /// helpers are as much test code as the `#[test]` functions beside them —
+    /// and so are test items at file scope.
+    #[test]
+    fn test_only_items_are_not_measured() {
+        let fns = analyze_str(
+            "fn product() {}\n\
+             #[test]\nfn a_test() {}\n\
+             #[cfg(test)]\nfn helper() {}\n\
+             #[cfg(test)]\nimpl Foo { fn made_for_tests(&self) {} }\n\
+             #[cfg(test)]\nmod tests {\n    fn nested_helper() {}\n    \
+             mod deeper { fn deep_helper() {} }\n}\n",
+        )
+        .expect("parses");
+
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["product"], "{names:?}");
+    }
+
+    /// A `cfg` is not inherited by the items nested inside the item it is
+    /// written on, so every **container** kind has to be gated, not just the
+    /// ones with a `fn` directly under them. This iterates the container kinds
+    /// that can hold a measurable function — a trait, an inline module, an
+    /// inherent and a trait `impl`, an `extern` block, a `const`/`static`
+    /// initialiser, a function body, and the members of an `impl`/`trait` — so
+    /// a new gap is a failing case rather than a missing test.
+    #[test]
+    fn no_container_smuggles_a_test_only_function_through() {
+        let containers = [
+            ("free fn", "#[cfg(test)]\nfn f() { if x {} }"),
+            ("#[test] fn", "#[test]\nfn f() { if x {} }"),
+            ("inline mod", "#[cfg(test)]\nmod m { fn f() { if x {} } }"),
+            ("trait", "#[cfg(test)]\ntrait T { fn f(&self) { if x {} } }"),
+            (
+                "inherent impl",
+                "#[cfg(test)]\nimpl S { fn f(&self) { if x {} } }",
+            ),
+            (
+                "trait impl",
+                "#[cfg(test)]\nimpl T for S { fn f(&self) { if x {} } }",
+            ),
+            (
+                "impl member",
+                "impl S { #[cfg(test)]\nfn f(&self) { if x {} } }",
+            ),
+            (
+                "trait member",
+                "trait T { #[cfg(test)]\nfn f(&self) { if x {} } }",
+            ),
+            (
+                "const initialiser",
+                "#[cfg(test)]\nconst C: i32 = { fn f() { if x {} } 1 };",
+            ),
+            (
+                "static initialiser",
+                "#[cfg(test)]\nstatic S: i32 = { fn f() { if x {} } 1 };",
+            ),
+            ("extern block", "#[cfg(test)]\nextern \"C\" { fn f(); }"),
+            ("fn body", "#[cfg(test)]\nfn outer() { fn f() { if x {} } }"),
+        ];
+
+        for (container, src) in containers {
+            let fns = analyze_str(src).expect("parses");
+            assert!(fns.is_empty(), "{container} leaked {fns:?}");
+        }
+    }
+
+    /// The exclusion is per item, not per file: the product functions around a
+    /// test module are measured exactly as before.
+    #[test]
+    fn product_items_beside_test_items_are_still_measured() {
+        let fns = analyze_str(
+            "fn f(x: i32) -> i32 { if x > 0 { 1 } else { 0 } }\n\
+             #[cfg(test)]\nmod tests {\n    #[test]\n    fn t() { if true {} }\n}\n\
+             impl Foo {\n    #[cfg(test)]\n    fn only_for_tests(&self) {}\n    \
+             fn real(&self) {}\n}\n",
+        )
+        .expect("parses");
+
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["f", "Foo::real"], "{names:?}");
+        assert_eq!(fns[0].complexity, 2);
     }
 }

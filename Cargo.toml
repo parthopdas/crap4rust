@@ -2,6 +2,32 @@
 name = "crap4rust"
 version = "0.1.0"
 edition = "2021"
+# Source-only floor: crap4rust's shipped (non-test) source needs 1.82
+# (`Option::is_none_or`, `std::iter::repeat_n`). CI enforces exactly this much
+# and no more (`.github/workflows/ci.yml`, `msrv` job): on ubuntu-latest,
+# `cargo build --locked` with rustc 1.82, against a lockfile regenerated for
+# this floor.
+#
+# What that does NOT prove, deliberately:
+#   * test-only code — `cargo build` never compiles `#[cfg(test)]` items or the
+#     `tests/` targets, so a post-1.82 API there passes this gate;
+#   * non-Ubuntu targets — the job runs on Linux only, so `#[cfg(windows)]`
+#     (or any other non-active-cfg) source is never compiled at the floor;
+#   * resolution by a 1.82 cargo — see below.
+#
+# The committed Cargo.lock is *not* part of this claim: it is the developer/CI
+# lock and needs 1.85, the first cargo that can parse an edition-2024
+# dependency manifest (clap_builder is one). A 1.82-*buildable* dependency set
+# exists, but cargo 1.82 cannot find it on its own — it predates the
+# rust-version-aware resolver and picks the newest dependencies (clap 4.6.6),
+# which fail. Consumers at the floor therefore need a newer, MSRV-aware cargo
+# to generate the lock, and can then build it with rustc 1.82. That is what
+# the CI job does, and the only regeneration path this crate claims to
+# support.
+#
+# Raising this is a support decision: check with the architect, don't just
+# follow a dependency up.
+rust-version = "1.82"
 description = "Computes the CRAP (Change Risk Anti-Patterns) metric per function for Rust cargo workspaces."
 
 [dependencies]
